@@ -71,11 +71,46 @@
   const NO_PHOTO = "assets/img/no-photo.svg";
   function thumb(sp, size = 44) {
     if (sp.im) {
-      return `<a class="thumb" href="${escapeHtml(sp.ip || sp.im)}" target="_blank" rel="noopener" title="${escapeHtml(sp.ic || "")}">` +
+      return `<a class="thumb" href="${escapeHtml(sp.ip || sp.im)}" target="_blank" rel="noopener" ` +
+        `data-name="${escapeHtml(sp.b)}" data-credit="${escapeHtml(sp.ic || "")}" aria-label="Photo of ${escapeHtml(sp.b)}: ${escapeHtml(sp.ic || "")} (opens the original)">` +
         `<img src="${escapeHtml(sp.im)}" alt="Photo of ${escapeHtml(sp.b)}" width="${size}" height="${size}" loading="lazy" ` +
         `onerror="this.onerror=null;this.src='${NO_PHOTO}';this.alt=''"></a>`;
     }
     return `<span class="thumb none" title="No openly licensed photo available"><img src="${NO_PHOTO}" alt="" width="${size}" height="${size}"></span>`;
+  }
+
+  // Large preview of a species photo on hover or keyboard focus (devices with a pointer only)
+  function setupPhotoPreview() {
+    if (!window.matchMedia("(hover: hover)").matches) return;
+    const box = document.createElement("div");
+    box.className = "photo-preview";
+    box.hidden = true;
+    box.innerHTML = '<img alt=""><div class="pp-name"></div><div class="pp-credit"></div>';
+    document.body.appendChild(box);
+    const img = box.querySelector("img");
+
+    const show = (a) => {
+      const src = a.querySelector("img")?.getAttribute("src");
+      if (!src || src.endsWith("no-photo.svg")) return;
+      img.src = src;
+      box.querySelector(".pp-name").textContent = a.dataset.name || "";
+      box.querySelector(".pp-credit").textContent = a.dataset.credit || "";
+      box.hidden = false;
+      // Beside the species column (or list item), so the name stays visible
+      const r = a.getBoundingClientRect(), w = box.offsetWidth, h = box.offsetHeight, pad = 12;
+      const col = (a.closest(".tabulator-cell, li") || a).getBoundingClientRect();
+      let left = col.right + pad;
+      if (left + w > window.innerWidth - pad) left = Math.max(pad, col.left - pad - w);
+      if (left + w > window.innerWidth - pad || left < 0) left = Math.max(pad, r.right + pad);
+      const top = Math.min(Math.max(pad, r.top + r.height / 2 - h / 2), window.innerHeight - h - pad);
+      box.style.left = `${left}px`; box.style.top = `${top}px`;
+    };
+    const hide = () => { box.hidden = true; };
+
+    document.addEventListener("mouseover", (e) => { const a = e.target.closest("a.thumb"); if (a) show(a); });
+    document.addEventListener("mouseout", (e) => { if (e.target.closest("a.thumb")) hide(); });
+    document.addEventListener("focusin", (e) => { const a = e.target.closest("a.thumb"); a ? show(a) : hide(); });
+    window.addEventListener("scroll", hide, true);
   }
 
   async function getJSON(path) {
@@ -100,6 +135,7 @@
     buildSummary();
     buildMap(brazil, biomes);
     buildTable();
+    setupPhotoPreview();
     buildSequenceForm();
   }).catch((err) => {
     console.error(err);
@@ -327,7 +363,7 @@
       data: species,
       index: "id",
       layout: "fitDataStretch",
-      rowHeight: 58,
+      rowHeight: 80,
       columnDefaults: { vertAlign: "middle" },
       height: "620px",
       placeholder: "No species match these filters.",
@@ -335,11 +371,11 @@
       columnHeaderVertAlign: "bottom",
       columns: [
         {
-          title: "Species", field: "b", frozen: true, minWidth: 270, headerFilter: "input",
+          title: "Species", field: "b", frozen: true, minWidth: 300, headerFilter: "input",
           headerFilterPlaceholder: "Filter",
           formatter: (cell) => {
             const s = cell.getRow().getData();
-            return `<div class="sp-cell">${thumb(s)}<div class="sp-text"><span class="sp">${escapeHtml(s.b)}</span>` +
+            return `<div class="sp-cell">${thumb(s, 64)}<div class="sp-text"><span class="sp">${escapeHtml(s.b)}</span>` +
               `<span class="sp-links">${links(s)}</span></div></div>`;
           }
         },
