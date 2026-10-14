@@ -1,0 +1,3522 @@
+---
+title: "Part 2: Database completeness, sequence ambiguity, depth and complementarity"
+author: "Thomas Luypaert"
+date: "2026-09-24"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+source(here::here("R", "io.R"))
+source(here::here("R", "figures.R"))
+```
+
+# Welcome
+
+This is Part 2 of the analysis for the paper *"Knowledge Gaps and Sequencing Priorities for Mammalian eDNA Metabarcoding in the World's Largest Tropical Forest Country"*. It uses the reference sequences and species data prepared in `1_Prepare_data.Rmd`.
+
+In this document, we assess reference database completeness across primers and taxonomic orders, sequence ambiguity (identical sequences shared between species), sequence divergence, the depth of coverage (number of distinct sequences per species), and the complementarity between primers.
+
+**Input:** `output/intermediate/1_Prepare_data.rds` (Part 1).
+
+**Output:** `output/intermediate/2_Assess_completeness_ambiguity_complementarity.rds`, used by Part 3; Figures 1 and 2 and the related supplementary figures and tables.
+
+# 0. Priors
+
+**Load R packages:**
+
+```{r}
+
+library(here)
+library(magrittr)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(colorspace)
+library(stringr)
+library(patchwork)
+library(rphylopic)
+
+```
+
+**Load data from Part 1:**
+
+```{r}
+
+load_step("1_Prepare_data", c(
+  "brz_mam_eDNA",
+  "brz_mam_synonyms",
+  "brz_mam_taxonomy",
+  "brz_mam_tree"
+))
+
+```
+
+**Plotting helper:**
+
+Since gghalves is no longer maintained, we manually create half-violins with standard ggplot2 layers.
+
+```{r}
+
+# Polygons for half-violins: for each level of the factor `x`, a kernel
+# density of `y` drawn to the right of the level's position, scaled to a
+# common maximum width.
+
+half_violin_polygons <- function(data, x, y, width = 0.45) {
+  groups <- split(as.data.frame(data), data[[x]], drop = TRUE)
+  do.call(rbind, lapply(groups, function(d) {
+    values <- d[[y]]
+    if (length(unique(values)) < 2) return(NULL)
+    dens <- stats::density(values)
+    pos  <- as.integer(d[[x]][1])
+    data.frame(
+      group  = pos,
+      region = d$region[1],
+      x      = c(pos, pos + dens$y / max(dens$y) * width, pos),
+      y      = c(min(dens$x), dens$x, max(dens$x))
+    )
+  }))
+}
+
+```
+
+# 1. Database completeness
+
+## 1.1. Presence of Brazilian species in the reference databases
+
+First, we will check whether any of our Brazilian mammals species or their synonyms are present in the reference database, and if so, how many unique sequences we have in the database per species.
+
+We will create a data frame that contains both the presence/absence data of Brazilian mammal species, as well as unique sequence counts, for each reference databases (amplicon region/primer pair combination).
+
+We will do this for two sets of the data:
+
+1.  All sequences: species with at least one sequence in the database, regardless of whether that sequence is shared with other species.
+2.  Unambiguous sequences: species with at least one sequence that is not shared with any other species in the checklist. Sequence ambiguity is assessed within the Brazilian mammal checklist. A species with several sequences, of which some are shared with other species and some are not, is counted as present for unambiguous sequences, because it retains at least one unambiguous sequence.
+
+In the code, the unambiguous sets are labelled `unique`.
+
+**For each species and its synonyms, check the presence and number of unique sequences in the eDNA dataframe for each region/primer combination:**
+
+```{r}
+# 2. Analyzing database completeness
+
+# Assess presence of Brazilian mammal species in the reference eDNA database.
+# We check for both:
+
+#   1) All detected sequences per species (including sequences shared across species)
+
+#   2) Unique sequences per species (sequences not shared with other species)
+
+# 2.1. Prepare list to store detected sequences for all species, for each region/primer
+
+brz_mam_sequences_all <- vector("list", length(brz_mam_eDNA))
+names(brz_mam_sequences_all) <- names(brz_mam_eDNA)
+
+for (i in seq_along(brz_mam_sequences_all)) {
+  
+  # Prepare a list to store sequences per species (including synonyms)
+  brz_mam_sequences_all[[i]] <- vector("list", length(brz_mam_synonyms))
+  names(brz_mam_sequences_all[[i]]) <- names(brz_mam_synonyms)
+  
+  for (j in seq_along(brz_mam_synonyms)) {
+    
+    # Subset eDNA sequences that match the species or its synonyms
+    subset <- brz_mam_eDNA[[i]][names(brz_mam_eDNA[[i]]) %in% brz_mam_synonyms[[j]]]
+    
+    # Extract first sequence for each entry
+    subset <- sapply(subset, function(x) x[1])
+    
+    # If sequences exist, convert to a data.frame, else fill with NA
+    if (length(subset) > 0) {
+      subset <- data.frame(
+        binomial = names(brz_mam_synonyms)[j],
+        sequence = unlist(subset)
+      )
+      subset <- unique(subset)  # Remove duplicate sequences
+    } else {
+      subset <- data.frame(
+        binomial = names(brz_mam_synonyms)[j],
+        sequence = NA
+      )
+    }
+    
+    # Extract region and primer information from the list name
+    subset$region <- stringr::str_split(names(brz_mam_sequences_all)[i], pattern = "_")[[1]][1]
+    subset$primer <- paste(
+      stringr::str_split(names(brz_mam_sequences_all)[i], pattern = "_")[[1]][-1],
+      collapse = "_"
+    )
+    
+    # Store results
+    brz_mam_sequences_all[[i]][[j]] <- subset
+  }
+  
+  # Combine all species for this region/primer into a single data.frame
+  brz_mam_sequences_all[[i]] <- data.table::rbindlist(brz_mam_sequences_all[[i]])
+}
+
+# 2.2. Detect sequences that are unique to each species
+
+# For sequences shared across multiple species, set to NA
+
+brz_mam_sequences_unique <- vector("list", length(brz_mam_sequences_all))
+
+for (i in seq_along(brz_mam_sequences_all)) {
+  brz_mam_sequences_unique[[i]] <- brz_mam_sequences_all[[i]] %>%
+    group_by(sequence) %>%
+    mutate(sequence = ifelse(n_distinct(binomial) > 1, NA, sequence)) %>%
+    ungroup()
+}
+
+# 2.3. Summarize completeness and sequence depth for all detected sequences
+
+# For each species, calculate:
+
+#   - nseq: number of distinct sequences
+#   - presence: 1 if >=1 sequence, 0 if none
+
+brz_mam_completeness_all <- vector("list", length(brz_mam_sequences_all))
+names(brz_mam_completeness_all) <- names(brz_mam_sequences_all)
+
+for (i in seq_along(brz_mam_sequences_all)) {
+  brz_mam_completeness_all[[i]] <- brz_mam_sequences_all[[i]] %>%
+    group_by(binomial) %>%
+    summarize(
+      nseq = n_distinct(sequence, na.rm = TRUE),
+      region = first(region),
+      primer = first(primer)
+    ) %>%
+    ungroup()
+  
+  # Replace NA sequence counts with 0 and create presence column
+  brz_mam_completeness_all[[i]]$nseq[is.na(brz_mam_completeness_all[[i]]$nseq)] <- 0
+  brz_mam_completeness_all[[i]]$presence <- ifelse(brz_mam_completeness_all[[i]]$nseq > 0, 1, 0)
+  
+  brz_mam_completeness_all[[i]] <- brz_mam_completeness_all[[i]] %>%
+    relocate(binomial, nseq, presence)
+}
+
+# 2.4. Summarize completeness for uniquely detected sequences
+brz_mam_completeness_unique <- vector("list", length(brz_mam_sequences_unique))
+names(brz_mam_completeness_unique) <- names(brz_mam_sequences_unique)
+
+for (i in seq_along(brz_mam_sequences_unique)) {
+  brz_mam_completeness_unique[[i]] <- brz_mam_sequences_unique[[i]] %>%
+    group_by(binomial) %>%
+    summarize(
+      nseq = n_distinct(sequence, na.rm = TRUE),
+      region = first(region),
+      primer = first(primer)
+    ) %>%
+    ungroup()
+  
+  brz_mam_completeness_unique[[i]]$nseq[is.na(brz_mam_completeness_unique[[i]]$nseq)] <- 0
+  brz_mam_completeness_unique[[i]]$presence <- ifelse(brz_mam_completeness_unique[[i]]$nseq > 0, 1, 0)
+  
+  brz_mam_completeness_unique[[i]] <- brz_mam_completeness_unique[[i]] %>%
+    relocate(binomial, nseq, presence)
+}
+
+# 2.5. Combine list elements into single data.frames for downstream analysis
+brz_mam_sequences_all <- data.table::rbindlist(brz_mam_sequences_all)
+brz_mam_sequences_unique <- data.table::rbindlist(brz_mam_sequences_unique)
+
+brz_mam_completeness_all <- data.table::rbindlist(brz_mam_completeness_all)
+brz_mam_completeness_unique <- data.table::rbindlist(brz_mam_completeness_unique)
+
+# 2.6. Remove temporary objects
+rm(subset, i, j)
+
+```
+
+## 1.2. Explore database completeness
+
+### 1.2.1. ***Database completeness per primer***
+
+Here, we calculate the percentage of Brazilian mammal species with at least one reference sequence for each primer, and, for species with reference sequences, how many distinct sequences are present (haplotypic depth).
+
+**Prepare the data for plotting:**
+
+```{r}
+
+# 1. Aggregate completeness for all detected sequences
+
+# For each region/primer, calculate percent of species with:
+
+#   - 1 sequence
+#   - 2–5 sequences
+#   - 6–10 sequences
+#   - >10 sequences
+
+# Also calculate cumulative sequence count per primer for ordering purposes
+
+brz_mam_primer_completeness_all <- brz_mam_completeness_all %>%
+  
+  # Remove species and presence columns, since we only need nseq, region, primer
+  select(-c(binomial, presence)) %>%
+  
+  # Group by amplicon region and primer
+  group_by(region, primer) %>%
+  
+  # Compute percentage of species in each nseq bin
+  summarize(
+    "1"    = (sum(nseq == 1) / length(brz_mam_synonyms)) * 100,
+    "2-5"  = (sum(nseq > 1 & nseq < 6) / length(brz_mam_synonyms)) * 100,
+    "6-10" = (sum(nseq > 5 & nseq < 11) / length(brz_mam_synonyms)) * 100,
+    ">10"  = (sum(nseq > 10) / length(brz_mam_synonyms)) * 100
+  ) %>%
+  
+  dplyr::ungroup() %>%
+  
+  # Convert wide-format nseq bins into long format for plotting or further analysis
+  tidyr::pivot_longer(
+    cols = c("1", "2-5", "6-10", ">10"),
+    names_to = "nseqs",
+    values_to = "seq_count"
+  ) %>%
+  
+  # Compute cumulative sequence counts per primer
+  group_by(primer) %>%
+  mutate(cumsum = sum(seq_count)) %>%
+  dplyr::ungroup()
+
+
+# 2. Repeat for uniquely detected sequences
+
+# Same as above, but using the uniqueness-filtered dataset
+
+brz_mam_primer_completeness_unique <- brz_mam_completeness_unique %>%
+  select(-c(binomial, presence)) %>%
+  group_by(region, primer) %>%
+  summarize(
+    "1"    = (sum(nseq == 1) / length(brz_mam_synonyms)) * 100,
+    "2-5"  = (sum(nseq > 1 & nseq < 6) / length(brz_mam_synonyms)) * 100,
+    "6-10" = (sum(nseq > 5 & nseq < 11) / length(brz_mam_synonyms)) * 100,
+    ">10"  = (sum(nseq > 10) / length(brz_mam_synonyms)) * 100
+  ) %>%
+  dplyr::ungroup() %>%
+  tidyr::pivot_longer(
+    cols = c("1", "2-5", "6-10", ">10"),
+    names_to = "nseqs",
+    values_to = "seq_count"
+  ) %>%
+  group_by(primer) %>%
+  mutate(cumsum = sum(seq_count)) %>%
+  dplyr::ungroup()
+
+
+# 3. Factor levels for nseq bins
+
+levels_nseqs <- c(">10", "6-10", "2-5", "1")
+
+brz_mam_primer_completeness_all$nseqs    <- factor(brz_mam_primer_completeness_all$nseqs, levels = levels_nseqs)
+brz_mam_primer_completeness_unique$nseqs <- factor(brz_mam_primer_completeness_unique$nseqs, levels = levels_nseqs)
+
+
+# 4. Create region_nseqs labels for plotting
+
+# Combines region and nseq bin for x-axis ordering
+
+brz_mam_primer_completeness_all$region_nseqs    <- paste(brz_mam_primer_completeness_all$region, brz_mam_primer_completeness_all$nseqs, sep = "_")
+brz_mam_primer_completeness_unique$region_nseqs <- paste(brz_mam_primer_completeness_unique$region, brz_mam_primer_completeness_unique$nseqs, sep = "_")
+
+levels_region_nseqs <- c(
+  "12S_>10", "12S_6-10", "12S_2-5", "12S_1",
+  "16S_>10", "16S_6-10", "16S_2-5", "16S_1",
+  "COI_>10", "COI_6-10", "COI_2-5", "COI_1",
+  "Cytb_>10", "Cytb_6-10", "Cytb_2-5", "Cytb_1"
+)
+
+brz_mam_primer_completeness_all$region_nseqs    <- factor(brz_mam_primer_completeness_all$region_nseqs, levels = levels_region_nseqs)
+brz_mam_primer_completeness_unique$region_nseqs <- factor(brz_mam_primer_completeness_unique$region_nseqs, levels = levels_region_nseqs)
+
+
+# 5. Reorder primers based on cumulative sequence counts
+
+# Primers with higher total sequence coverage appear first
+
+brz_mam_primer_completeness_all$primer    <- reorder(brz_mam_primer_completeness_all$primer, brz_mam_primer_completeness_all$cumsum, decreasing = TRUE)
+brz_mam_primer_completeness_unique$primer <- reorder(brz_mam_primer_completeness_unique$primer, brz_mam_primer_completeness_unique$cumsum, decreasing = TRUE)
+
+```
+
+**Plot the data:**
+
+```{r, fig.width=30, fig.height=7.5, fig.dpi= 600}
+
+# 1. Define color palettes for each region
+
+# Lighten base colors to create a gradient for different nseq bins
+
+palette_1 <- colorspace::lighten(col = "#68a898", amount = seq(0.0, 0.5, length.out = 4))
+palette_2 <- colorspace::lighten(col = "#b62c25", amount = seq(0.0, 0.5, length.out = 4))
+palette_3 <- colorspace::lighten(col = "#f6b332", amount = seq(0.0, 0.5, length.out = 4))
+palette_4 <- colorspace::lighten(col = "#2965a2", amount = seq(0.0, 0.5, length.out = 4))
+
+# Combined palette keyed by region and nseq bin
+
+combined_palette <- c(
+  `12S_>10` = palette_1[1], `12S_6-10` = palette_1[2], `12S_2-5` = palette_1[3], `12S_1` = palette_1[4],
+  `16S_>10` = palette_2[1], `16S_6-10` = palette_2[2], `16S_2-5` = palette_2[3], `16S_1` = palette_2[4],
+  `COI_>10` = palette_3[1], `COI_6-10` = palette_3[2], `COI_2-5` = palette_3[3], `COI_1` = palette_3[4],
+  `Cytb_>10` = palette_4[1], `Cytb_6-10` = palette_4[2], `Cytb_2-5` = palette_4[3], `Cytb_1` = palette_4[4]
+)
+
+# Custom labels for legend (showing only nseq bins)
+
+custom_labels <- c(
+  "12S_>10" = ">10", "12S_6-10" = "6-10", "12S_2-5" = "2-5", "12S_1" = "1",
+  "16S_>10" = ">10", "16S_6-10" = "6-10", "16S_2-5" = "2-5", "16S_1" = "1",
+  "COI_>10" = ">10", "COI_6-10" = "6-10", "COI_2-5" = "2-5", "COI_1" = "1",
+  "Cytb_>10" = ">10", "Cytb_6-10" = "6-10", "Cytb_2-5" = "2-5", "Cytb_1" = "1"
+)
+
+# 2. Plot for all detected sequences
+
+# Stacked barplot showing percentage of species with sequences per primer
+
+primer_completeness_plot_all <- ggplot(brz_mam_primer_completeness_all) +
+  
+  # Stacked bars for each primer, colored by region_nseqs
+  geom_bar(aes(x = primer, y = seq_count, fill = region_nseqs),
+           position = "stack", stat = "identity", alpha = 0.8) +
+  
+  # Apply manual colors and custom labels
+  scale_fill_manual(values = combined_palette,
+                    labels = custom_labels,
+                    name = "Number of barcodes per species") +
+  
+  # Add labels showing cumulative completeness on top of bars
+  geom_text(aes(x = primer, y = cumsum, label = round(cumsum, 1)),
+            vjust = -0.5, size = 7, color = "black") +
+  
+  # Annotate median database completeness
+  annotate("text", x = 0.7, y = 95, 
+           label = paste("Median database completeness =", 
+                         round(median(brz_mam_primer_completeness_all$cumsum), 1), "%"), 
+           hjust = 0, size = 7, color = "black") +
+  
+  # Axis and theme customization
+  theme_bw() +
+  scale_y_continuous(limits = c(0,101), expand = c(0,0)) +
+  scale_x_discrete(labels = function(x) str_to_upper(x)) +
+  ylab("Species with barcode (%)") +
+  xlab("Primers for different regions") +
+  theme(
+    axis.text.x = element_text(size = 14, color = "black", face = "bold", angle = 45, hjust = 1),
+    axis.text.y = element_text(size = 20, color = "black"),
+    axis.title.y = element_text(size = 22, color = "black"),
+    axis.title.x = element_blank(),
+    panel.grid = element_blank(),
+    plot.title = element_text(face = "bold", hjust = 0.5, size = 30),
+    legend.position = c(.67, 0.68),
+    legend.direction = "horizontal",
+    legend.title.position = "top",
+    legend.title = element_text(hjust = 0.5, size = 18, color = "black"),
+    legend.text = element_text(size = 16, color = "black"),
+    panel.spacing.x = grid::unit(0, "mm"),
+    strip.placement = "outside",
+    strip.background = element_blank()
+  ) +
+  ggtitle("All sequences")
+
+# 3. Plot for uniquely detected sequences
+
+# Similar to above but for unique sequences only
+
+primer_completeness_plot_unique <- ggplot(brz_mam_primer_completeness_unique) +
+  geom_bar(aes(x = primer, y = seq_count, fill = region_nseqs),
+           position = "stack", stat = "identity", alpha = 0.8) +
+  scale_fill_manual(values = combined_palette,
+                    labels = custom_labels,
+                    name = "Number of barcodes per species") +
+  geom_text(aes(x = primer, y = cumsum, label = round(cumsum, 1)),
+            vjust = -0.5, size = 7, color = "black") +
+  annotate("text", x = 0.7, y = 95, 
+           label = paste("Median database completeness =", 
+                         round(median(brz_mam_primer_completeness_unique$cumsum), 1), "%"), 
+           hjust = 0, size = 7, color = "black") +
+  theme_bw() +
+  scale_y_continuous(limits = c(0,101), expand = c(0,0)) +
+  scale_x_discrete(labels = function(x) str_to_upper(x)) +
+  ylab("Species with barcode (%)") +
+  xlab("Primers for different regions") +
+  theme(
+    axis.text.x = element_text(size = 14, color = "black", face = "bold", angle = 45, hjust=1),
+    axis.text.y = element_text(size = 20, color = "black"),
+    axis.title.y = element_text(size = 22, color = "black"),
+    axis.title.x = element_blank(),
+    panel.grid = element_blank(),
+    plot.title = element_text(face = "bold", hjust = 0.5, size = 30),
+    legend.position = c(.67,0.68),
+    legend.direction = "horizontal",
+    legend.title.position = "top",
+    legend.title = element_text(hjust = 0.5, size = 18, color = "black"),
+    legend.text = element_text(size = 16, color = "black"),
+    panel.spacing.x = grid::unit(0, "mm"),
+    strip.placement = "outside",
+    strip.background = element_blank()
+  ) +
+  ggtitle("Unambiguous sequences")
+
+# 4. Combine the two plots using patchwork
+
+# Add a spacer in between to separate the two plots visually
+
+primer_completeness_plot <- primer_completeness_plot_all +
+  patchwork::plot_spacer() +
+  primer_completeness_plot_unique +
+  patchwork::plot_layout(widths = c(7.75, 0.5, 7.75))
+
+# Display the combined plot
+
+primer_completeness_plot
+
+```
+
+**Save the plots**:
+
+```{r}
+
+save_figure(primer_completeness_plot, "Fig1a_completeness_by_primer", width = 15, height = 7.5)
+
+```
+
+**Clean up the environment**:
+
+```{r}
+
+rm(primer_completeness_plot_all)
+rm(primer_completeness_plot_unique)
+rm(primer_completeness_plot)
+rm(levels_region_nseqs)
+rm(levels_nseqs)
+
+
+```
+
+### 1.2.2. ***Database completeness per primer and order***
+
+We look at the completeness and depth per primer for each taxonomic order. These plots are saved as supplementary figures (`completeness_by_primer_<Order>`).
+
+**Prepare the data:**
+
+```{r}
+
+# 1. Count the number of species per clade (order)
+
+# This creates a data frame with the total number of species in each mammalian order.
+
+nspecies_per_clade <- 
+  brz_mam_taxonomy %>%
+  select(order) %>%
+  group_by(order) %>%
+  mutate(n_species = n()) %>%  # Count species per order
+  unique() %>%                 # Keep one row per order
+  ungroup()
+
+
+# 2. Quantify completeness per clade and primer (all sequences)
+
+# For each order, region, and primer:
+
+#   - Count number of species with 1, 2-5, 6-10, or >10 sequences
+#   - Calculate percentage relative to total species in that order
+
+brz_mam_clade_primer_completeness_all <- 
+  merge(brz_mam_completeness_all, brz_mam_taxonomy, by = "binomial") %>%
+  merge(., nspecies_per_clade, by = "order") %>%
+  select(binomial, nseq, region, primer, order, n_species) %>%
+  group_by(order, region, primer) %>%
+  summarize(
+    "1"     = sum(nseq == 1),
+    "2-5"   = sum(nseq > 1 & nseq < 6),
+    "6-10"  = sum(nseq > 5 & nseq < 11),
+    ">10"   = sum(nseq > 10),
+    n_species = unique(n_species)
+  ) %>%
+  ungroup() %>%
+  tidyr::pivot_longer(
+    cols = c("1", "2-5", "6-10", ">10"),
+    names_to = "nseqs",
+    values_to = "seq_count"
+  ) %>%
+  mutate(seq_perc = (seq_count / n_species) * 100) %>%   # Percentage of species in clade
+  group_by(order, region, primer) %>%
+  mutate(cumsum = sum(seq_perc)) %>%                     # Cumulative completeness
+  ungroup()
+
+
+# 3. Repeat for unique sequences only
+
+# Same as above but considering only unambiguous (unique) sequences.
+
+brz_mam_clade_primer_completeness_unique <- 
+  merge(brz_mam_completeness_unique, brz_mam_taxonomy, by = "binomial") %>%
+  merge(., nspecies_per_clade, by = "order") %>%
+  select(binomial, nseq, region, primer, order, n_species) %>%
+  group_by(order, region, primer) %>%
+  summarize(
+    "1"     = sum(nseq == 1),
+    "2-5"   = sum(nseq > 1 & nseq < 6),
+    "6-10"  = sum(nseq > 5 & nseq < 11),
+    ">10"   = sum(nseq > 10),
+    n_species = unique(n_species)
+  ) %>%
+  ungroup() %>%
+  tidyr::pivot_longer(
+    cols = c("1", "2-5", "6-10", ">10"),
+    names_to = "nseqs",
+    values_to = "seq_count"
+  ) %>%
+  mutate(seq_perc = (seq_count / n_species) * 100) %>%
+  group_by(order, region, primer) %>%
+  mutate(cumsum = sum(seq_perc)) %>%
+  ungroup()
+
+
+# 4. Final fine-tuning: factor levels and combined identifiers
+
+# Order nseqs for plotting, and create region_nseqs combining region and nseqs.
+
+factor_levels <- c(">10", "6-10", "2-5", "1")
+
+brz_mam_clade_primer_completeness_all$nseqs <- factor(
+  brz_mam_clade_primer_completeness_all$nseqs,
+  levels = factor_levels
+)
+
+brz_mam_clade_primer_completeness_unique$nseqs <- factor(
+  brz_mam_clade_primer_completeness_unique$nseqs,
+  levels = factor_levels
+)
+
+brz_mam_clade_primer_completeness_all$region_nseqs <- paste(
+  brz_mam_clade_primer_completeness_all$region,
+  brz_mam_clade_primer_completeness_all$nseqs,
+  sep = "_"
+)
+
+brz_mam_clade_primer_completeness_unique$region_nseqs <- paste(
+  brz_mam_clade_primer_completeness_unique$region,
+  brz_mam_clade_primer_completeness_unique$nseqs,
+  sep = "_"
+)
+
+region_levels <- c(
+  "12S_>10", "12S_6-10", "12S_2-5", "12S_1",
+  "16S_>10", "16S_6-10", "16S_2-5", "16S_1",
+  "COI_>10", "COI_6-10", "COI_2-5", "COI_1",
+  "Cytb_>10", "Cytb_6-10", "Cytb_2-5", "Cytb_1"
+)
+
+brz_mam_clade_primer_completeness_all$region_nseqs <- factor(
+  brz_mam_clade_primer_completeness_all$region_nseqs,
+  levels = region_levels
+)
+
+brz_mam_clade_primer_completeness_unique$region_nseqs <- factor(
+  brz_mam_clade_primer_completeness_unique$region_nseqs,
+  levels = region_levels
+)
+
+
+```
+
+**Plot the data:**
+
+```{r, fig.width=28, fig.height=8, fig.dpi= 600}
+
+# 1. Prepare phylopic images, mirroring, size multipliers, and colors
+
+# We store silhouettes for each mammalian order and customize display parameters.
+
+phylopic_uuids <- c(
+  Didelphimorphia = "0e1fe113-feb7-46db-8a10-12f22f80332c",
+  Lagomorpha      = "031b0020-2389-473b-8b71-d855ec2c06d5",
+  Sirenia         = "12597d6c-9c80-4510-9826-975eabddc597",
+  Cingulata       = "5d59b5ce-c1dd-40f6-b295-8d2629b9775e",
+  Pilosa          = "925fa570-10d9-4319-bd8a-e64ad7987900",
+  Primates        = "cbfc863c-9ca3-441e-9e38-95876fe19203",
+  Rodentia        = "9c234021-ce53-45d9-8fdd-b0ca3115a451",
+  Artiodactyla    = "f36c9daa-a102-42dd-88ac-a126753943d2",
+  Carnivora       = "9b6dc5fd-eeb9-4760-99e4-fca70ec74db0",
+  Chiroptera      = "21180755-3394-40bf-93eb-810954c0f7ba",
+  Perissodactyla  = "4fcdd729-6eb6-42b8-be67-303077fa6d19"
+)
+
+phylopic_cache <- cache_file("phylopics.rds")
+if (!file.exists(phylopic_cache)) {
+  saveRDS(lapply(phylopic_uuids, function(u) rphylopic::get_phylopic(uuid = u)), phylopic_cache)
+}
+phylopics <- readRDS(phylopic_cache)
+
+rm(phylopic_uuids, phylopic_cache)
+
+# Mirror flags for horizontal flipping
+
+mirror <- c(TRUE, FALSE, TRUE, FALSE, TRUE, FALSE, TRUE, FALSE, TRUE, FALSE, FALSE)
+
+# Relative icon sizes
+
+size_multiplier <- c(1, 1.5, 1, 1.5, 1, 1, 2, 1.5, 1.5, 1, 1)
+
+# Custom colors for orders
+
+custom_colors <- c(
+  "Didelphimorphia" = "#92ad88", 
+  "Lagomorpha"      = "#b5bd7e",
+  "Sirenia"         = "#d8a4d5",
+  "Cingulata"       = "#73968d",
+  "Pilosa"          = "#e8ccad",
+  "Primates"        = "#e3a88c",
+  "Rodentia"        = "#cc9ea5",
+  "Artiodactyla"    = "#9ba3c8",
+  "Carnivora"       = "#94a7b8",
+  "Chiroptera"      = "#80a0a6",
+  "Perissodactyla"  = "#cbc29d"
+)
+
+
+# 2. Generate clade-level completeness plots (all sequences)
+
+# Loop through each order and create a stacked bar plot showing the proportion
+# of species with 1, 2-5, 6-10, or >10 sequences for each primer and region.
+# Add phylopic icons 
+
+clade_primer_completeness_plot_list_all <- vector("list")
+
+orders <- unique(brz_mam_clade_primer_completeness_all$order)
+
+for (i in seq_along(orders)) {
+  
+  order <- orders[i]
+  
+  # Subset data for current order
+  data_all <- brz_mam_clade_primer_completeness_all %>%
+    filter(order == !!order)
+  
+  # Reorder primers by cumulative completeness
+  data_all$primer <- reorder(data_all$primer, data_all$cumsum, decreasing = TRUE)
+  
+  # Create plot
+  clade_primer_completeness_plot_list_all[[i]] <- 
+    ggplot(data_all) +
+    geom_hline(yintercept = 100, linetype = "dashed", linewidth = 0.5, color = "grey80") +
+    geom_bar(aes(x = primer, y = seq_perc, fill = region_nseqs),
+             position = "stack", stat = "identity", alpha = 0.8) +
+    geom_text(aes(x = primer, y = cumsum, label = round(cumsum, 1)), vjust = -0.5, size = 8) +
+    scale_fill_manual(values = combined_palette, labels = custom_labels, name = "Number of unique barcodes") +
+    scale_y_continuous(
+      limits = c(0, ifelse(max(data_all$cumsum) * 1.7 > 100, max(data_all$cumsum) * 1.7, 110)),
+      expand = c(0, 0),
+      breaks = seq(0, 100, 20),
+      labels = function(x) ifelse(x <= 100, x, "")
+    ) +
+    scale_x_discrete(labels = str_to_upper) +
+    ylab("Species with barcode (%)") +
+    xlab("Primers for different regions") +
+    theme_bw() +
+    theme(
+      axis.text.x = element_text(size = 14, face = "bold", color = "black"),
+      axis.text.y = element_text(size = 22, color = "black"),
+      axis.title.y = element_text(size = 26, color = "black"),
+      axis.title.x = element_blank(),
+      panel.grid = element_blank(),
+      legend.key = element_rect(fill = "transparent"),
+      plot.title = element_text(hjust = 0.5, face = "bold", size = 30),
+      legend.position = c(0.24, 0.85),
+      legend.direction = "horizontal",
+      legend.title.position = "top",
+      legend.title = element_text(hjust = 0.5, size = 30, color = "black"),
+      legend.text = element_text(size = 12, color = "black")
+    ) +
+    ggtitle("All sequences") +
+    add_phylopic(
+      img = phylopics[[order]],
+      x = levels(data_all$primer)[length(levels(data_all$primer)) - 3],
+      y = ifelse(max(data_all$cumsum) * 1.7 > 100, max(data_all$cumsum) * 1.7, 100) * 0.8,
+      height = 20 * size_multiplier[i],
+      alpha = 0.8,
+      horizontal = mirror[i],
+      fill = custom_colors[order]
+    )
+}
+
+
+# 3. Generate clade-level completeness plots (unique sequences)
+
+clade_primer_completeness_plot_list_unique <- vector("list")
+
+orders_unique <- unique(brz_mam_clade_primer_completeness_unique$order)
+
+for (i in seq_along(orders_unique)) {
+  
+  order <- orders_unique[i]
+  
+  data_unique <- brz_mam_clade_primer_completeness_unique %>%
+    filter(order == !!order)
+  
+  data_unique$primer <- reorder(data_unique$primer, data_unique$cumsum, decreasing = TRUE)
+  
+  clade_primer_completeness_plot_list_unique[[i]] <- 
+    ggplot(data_unique) +
+    geom_hline(yintercept = 100, linetype = "dashed", linewidth = 0.5, color = "grey80") +
+    geom_bar(aes(x = primer, y = seq_perc, fill = region_nseqs),
+             position = "stack", stat = "identity", alpha = 0.8) +
+    geom_text(aes(x = primer, y = cumsum, label = round(cumsum, 1)), vjust = -0.5, size = 8) +
+    scale_fill_manual(values = combined_palette, labels = custom_labels, name = "Number of unique barcodes") +
+    scale_y_continuous(
+      limits = c(0, ifelse(max(data_unique$cumsum) * 1.7 > 100, max(data_unique$cumsum) * 1.7, 110)),
+      expand = c(0, 0),
+      breaks = seq(0, 100, 20),
+      labels = function(x) ifelse(x <= 100, x, "")
+    ) +
+    scale_x_discrete(labels = str_to_upper) +
+    ylab("Species with barcode (%)") +
+    xlab("Primers for different regions") +
+    theme_bw() +
+    theme(
+      axis.text.x = element_text(size = 14, face = "bold", color = "black"),
+      axis.text.y = element_text(size = 22, color = "black"),
+      axis.title.y = element_text(size = 26, color = "black"),
+      axis.title.x = element_blank(),
+      panel.grid = element_blank(),
+      legend.key = element_rect(fill = "transparent"),
+      plot.title = element_text(hjust = 0.5, face = "bold", size = 30),
+      legend.position = "none",
+      legend.text = element_text(size = 12, color = "black")
+    ) +
+    ggtitle("Unambiguous sequences")
+}
+
+
+# 4. Combine all & unique plots for each order
+
+clade_primer_completeness_plot_list <- vector("list")
+
+for (i in seq_along(clade_primer_completeness_plot_list_all)) {
+  clade_primer_completeness_plot_list[[i]] <-
+    clade_primer_completeness_plot_list_all[[i]] +
+    clade_primer_completeness_plot_list_unique[[i]] +
+    patchwork::plot_annotation(
+      tag_levels = "A",
+      tag_suffix = "."
+    ) &
+    theme(plot.tag = element_text(face = "bold", size = 35))
+}
+
+clade_primer_completeness_plot_list[[1]]
+
+
+```
+
+**Save the plots:**
+
+```{r}
+
+# Supplementary figure numbers (Figs S2-S12, orders in alphabetical order)
+
+fig_s_number <- c(Artiodactyla = 2, Carnivora = 3, Chiroptera = 4, Cingulata = 5,
+                  Didelphimorphia = 6, Lagomorpha = 7, Perissodactyla = 8, Pilosa = 9,
+                  Primates = 10, Rodentia = 11, Sirenia = 12)
+
+for (i in seq_along(clade_primer_completeness_plot_list)) {
+  save_figure(clade_primer_completeness_plot_list[[i]],
+              paste0("FigS", fig_s_number[[orders[i]]], "_completeness_by_primer_", orders[i]),
+              width = 28, height = 8, type = "supplementary")
+}
+
+rm(fig_s_number)
+
+```
+
+**Clean the environment:**
+
+```{r}
+rm(combined_palette)
+rm(custom_labels)
+rm(mirror)
+rm(i)
+rm(palette_1)
+rm(palette_2)
+rm(size_multiplier)
+rm(order)
+rm(nspecies_per_clade)
+rm(data_unique)
+rm(data_all)
+rm(clade_primer_completeness_plot_list)
+rm(clade_primer_completeness_plot_list_all)
+rm(clade_primer_completeness_plot_list_unique)
+```
+
+### 1.2.3. ***Database completeness at increasing depth***
+
+Code for plotting Figure 1C.
+
+**Prepare the data:**
+
+```{r}
+
+# 1. Compute completeness per depth for all sequences
+
+brz_mam_primer_completeness_depth_all <- brz_mam_completeness_all %>%
+  select(!c(binomial, presence)) %>%
+  group_by(region, primer) %>%
+  summarize(
+    ">=1"  = sum(nseq >= 1)  / length(brz_mam_synonyms) * 100,
+    ">=2"  = sum(nseq >= 2)  / length(brz_mam_synonyms) * 100,
+    ">=5"  = sum(nseq >= 5)  / length(brz_mam_synonyms) * 100,
+    ">=10" = sum(nseq >= 10) / length(brz_mam_synonyms) * 100
+  ) %>%
+  ungroup() %>%
+  tidyr::pivot_longer(cols = c(">=1", ">=2", ">=5", ">=10"),
+                      names_to = "nseqs",
+                      values_to = "seq_count") %>%
+  mutate(nseqs = factor(nseqs, levels = c(">=1", ">=2", ">=5", ">=10")))
+
+
+# Mean values for annotation
+
+mean_by_threshold <- brz_mam_primer_completeness_depth_all %>%
+  group_by(nseqs) %>%
+  summarize(mean_seq_count = mean(seq_count, na.rm = TRUE)) %>%
+  mutate(
+    perc_change = (mean_seq_count - first(mean_seq_count)) / first(mean_seq_count) * 100,
+    label = ifelse(perc_change == 0,
+                   "Baseline",
+                   sprintf("%+.0f%%", perc_change))
+  )
+
+# 2. Compute completeness per depth for unique sequences
+
+brz_mam_primer_completeness_depth_unique <- brz_mam_completeness_unique %>%
+  select(!c(binomial, presence)) %>%
+  group_by(region, primer) %>%
+  summarize(
+    ">=1"  = sum(nseq >= 1)  / length(brz_mam_synonyms) * 100,
+    ">=2"  = sum(nseq >= 2)  / length(brz_mam_synonyms) * 100,
+    ">=5"  = sum(nseq >= 5)  / length(brz_mam_synonyms) * 100,
+    ">=10" = sum(nseq >= 10) / length(brz_mam_synonyms) * 100
+  ) %>%
+  ungroup() %>%
+  tidyr::pivot_longer(cols = c(">=1", ">=2", ">=5", ">=10"),
+                      names_to = "nseqs",
+                      values_to = "seq_count") %>%
+  mutate(nseqs = factor(nseqs, levels = c(">=1", ">=2", ">=5", ">=10")))
+
+mean_by_threshold_unique <- brz_mam_primer_completeness_depth_unique %>%
+  group_by(nseqs) %>%
+  summarize(mean_seq_count = mean(seq_count, na.rm = TRUE)) %>%
+  mutate(
+    perc_change = (mean_seq_count - first(mean_seq_count)) / first(mean_seq_count) * 100,
+    label = ifelse(perc_change == 0,
+                   "Baseline",
+                   sprintf("%+.0f%%", perc_change))
+  )
+
+```
+
+**Plot the data:**
+
+```{r}
+
+# 3. Plot function 
+
+primer_colors <- c(
+  "12S" = "#68a898",
+  "16S" = "#b62c25",
+  "COI" = "#f6b332",
+  "Cytb" = "#2965a2"
+)
+
+make_depth_plot <- function(data, summary_df, title) {
+  
+  ggplot(data, aes(x = nseqs, y = seq_count, color = region, fill = region, group = primer)) +
+    
+    geom_line(linewidth = 0.8, alpha = 0.4) +
+    
+    geom_smooth(
+      aes(group = 1),
+      color = "black",
+      se = FALSE,
+      linewidth = 1.5,
+      linetype = "solid",
+      method = "loess",
+      span = 0.8
+    ) +
+    
+    geom_point(
+      inherit.aes = FALSE,
+      data = summary_df,
+      aes(x = nseqs, y = mean_seq_count),
+      shape = 21, size = 4, fill = "white", color = "black", stroke = 1.2
+    ) +
+    
+    geom_text(
+      inherit.aes = FALSE,
+      data = summary_df,
+      aes(x = nseqs, y = 100, label = label),
+      vjust = 0, size = 5, fontface = "bold"
+    ) +
+    
+    scale_color_manual(values = primer_colors) +
+    scale_fill_manual(values = primer_colors) +
+    
+    scale_y_continuous(limits = c(0, 100), expand = c(0.05, 0.05)) +
+    
+    labs(x = NULL, y = "Species with barcode (%)") +
+    theme_bw() +
+    theme(
+      axis.text.x = element_text(size = 14, color = "black", face = "bold"),
+      axis.text.y = element_text(size = 18, color = "black"),
+      axis.title.y = element_text(size = 20),
+      panel.grid = element_blank(),
+      legend.position = "none",
+      plot.title = element_text(size = 30, face = "bold", hjust = 0.5)
+    ) +
+    ggtitle(title)
+}
+
+primer_coverage_per_depth_all    <- make_depth_plot(brz_mam_primer_completeness_depth_all,    mean_by_threshold,        "All sequences")
+
+primer_coverage_per_depth_all
+
+primer_coverage_per_depth_unique <- make_depth_plot(brz_mam_primer_completeness_depth_unique, mean_by_threshold_unique, "Unambiguous sequences")
+
+primer_coverage_per_depth_unique
+
+```
+
+**Save the data:**
+
+```{r}
+
+save_figure(primer_coverage_per_depth_all, "Fig1c_completeness_by_depth_all", width = 7.5, height = 7.18)
+save_figure(primer_coverage_per_depth_unique, "Fig1c_completeness_by_depth_unambiguous", width = 7.5, height = 7.18)
+
+```
+
+### 1.2.4. ***Mean database completeness per order***
+
+Code for plotting Figure 1B.
+
+**Prepare the data:**
+
+```{r}
+
+# 1. Mean completeness per clade — ALL
+
+brz_mam_clade_mean_completeness_all <- 
+  brz_mam_clade_primer_completeness_all %>%
+    select(primer, order, cumsum, n_species, region) %>%
+    distinct() %>%
+    group_by(primer, order) %>%
+    summarise(
+      cumsum = mean(cumsum),
+      region = first(region),
+      .groups = "drop"
+    ) %>%
+    group_by(order) %>%
+    mutate(mean_percentage = mean(cumsum)) %>%
+    ungroup() %>%
+    arrange(desc(mean_percentage))
+
+
+# 2. Mean completeness per clade — UNIQUE
+
+brz_mam_clade_mean_completeness_unique <- 
+  brz_mam_clade_primer_completeness_unique %>%
+  select(primer, order, cumsum, n_species, region) %>%
+  distinct() %>%
+  group_by(primer, order) %>%
+  summarise(
+      cumsum = mean(cumsum),
+      region = first(region),
+      .groups = "drop"
+    ) %>%
+  group_by(order) %>%
+  mutate(mean_percentage = mean(cumsum)) %>%
+  ungroup() %>%
+  arrange(desc(mean_percentage))
+
+
+# 3. Set factor order (after arranging)
+
+brz_mam_clade_mean_completeness_all$order <- factor(
+  brz_mam_clade_mean_completeness_all$order,
+  levels = unique(brz_mam_clade_mean_completeness_all$order)
+)
+
+brz_mam_clade_mean_completeness_unique$order <- factor(
+  brz_mam_clade_mean_completeness_unique$order,
+  levels = unique(brz_mam_clade_mean_completeness_unique$order)
+)
+
+
+# 4. Summary statistics
+
+mean_overall_percentage_all    <- mean(brz_mam_clade_mean_completeness_all$mean_percentage)
+sd_overall_percentage_all      <- sd(brz_mam_clade_mean_completeness_all$mean_percentage)
+
+mean_overall_percentage_unique <- mean(brz_mam_clade_mean_completeness_unique$mean_percentage)
+sd_overall_percentage_unique   <- sd(brz_mam_clade_mean_completeness_unique$mean_percentage)
+
+
+```
+
+**Plot the data:**
+
+```{r}
+
+# 1. Compute mean completeness values (overall)
+
+library(forcats)
+
+mean_overall_all <- mean(brz_mam_clade_mean_completeness_all$cumsum, na.rm = TRUE)
+mean_overall_unique <- mean(brz_mam_clade_mean_completeness_unique$cumsum, na.rm = TRUE)
+
+
+# 2. Prepare summary tables for plotting
+
+# All sequences
+
+brz_summary_all <- brz_mam_clade_mean_completeness_all %>%
+  rename(order_col = order, cumsum_val = cumsum) %>%
+  group_by(order_col) %>%
+  summarise(mean_order = mean(cumsum_val, na.rm = TRUE)) %>%
+  ungroup() %>%
+  mutate(order_col = fct_reorder(order_col, mean_order))
+
+# Unique sequences
+
+brz_summary_unique <- brz_mam_clade_mean_completeness_unique %>%
+  rename(order_col = order, cumsum_val = cumsum) %>%
+  group_by(order_col) %>%
+  summarise(mean_order = mean(cumsum_val, na.rm = TRUE)) %>%
+  ungroup() %>%
+  mutate(order_col = fct_reorder(order_col, mean_order))
+
+
+# 3. Plot mean completeness per clade (ALL sequences)
+
+mean_coverage_per_taxon_all <- 
+  brz_mam_clade_mean_completeness_all %>%
+  rename(order_col = order, cumsum_val = cumsum) %>%
+  mutate(order_col = fct_reorder(order_col, cumsum_val)) %>%
+  ggplot(aes(x = order_col, y = cumsum_val)) +
+  
+  # Vertical lines showing deviation from global mean
+  geom_segment(
+    data = brz_summary_all,
+    aes(x = order_col, xend = order_col,
+        y = mean_overall_all, yend = mean_order, color = order_col),
+    linewidth = 1
+  ) +
+  
+  # Horizontal reference line (overall mean)
+  geom_hline(yintercept = mean_overall_all, color = "gray70", size = 0.6) +
+
+  # Raw jittered points
+  geom_jitter(
+    size = 2, alpha = 0.25,
+    position = position_jitter(width = 0.2, height = 0),
+    aes(color = order_col, fill = order_col)
+  ) +
+
+  # Mean per order (large point)
+  stat_summary(
+    fun = mean,
+    geom = "point",
+    aes(color = order_col),
+    size = 4, stroke = 1
+  ) +
+
+  # Annotated label
+  annotate(
+    "text",
+    x = -Inf, y = Inf,
+    label = paste0("Mean = ", round(mean_overall_all, 2), "%"),
+    hjust = -0.1, vjust = 1.5,
+    size = 6, color = "black", fontface = "bold"
+  ) +
+  
+  scale_color_manual(values = custom_colors) +
+  scale_fill_manual(values = custom_colors) +
+  
+  scale_y_continuous(expand = c(0.05, 0.05)) +
+  labs(x = NULL, y = "Mean completeness (%)") +
+  
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(size = 14, color = "black", face = "bold", angle = 45, hjust = 1),
+    axis.text.y = element_text(size = 18, color = "black"),
+    axis.title.y = element_text(size = 20, color = "black"),
+    panel.grid = element_blank(),
+    legend.key = element_rect(fill = "transparent"),
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 30),
+    legend.position = "none"
+  ) +
+  ggtitle("All sequences")
+
+
+mean_coverage_per_taxon_all
+
+
+# 4. Plot mean completeness per clade (UNIQUE sequences)
+
+mean_coverage_per_taxon_unique <- 
+  brz_mam_clade_mean_completeness_unique %>%
+  rename(order_col = order, cumsum_val = cumsum) %>%
+  mutate(order_col = fct_reorder(order_col, cumsum_val)) %>%
+  ggplot(aes(x = order_col, y = cumsum_val)) +
+  
+  geom_segment(
+    data = brz_summary_unique,
+    aes(x = order_col, xend = order_col,
+        y = mean_overall_unique, yend = mean_order, color = order_col),
+    linewidth = 1
+  ) +
+
+  geom_hline(yintercept = mean_overall_unique, color = "gray70", size = 0.6) +
+
+  geom_jitter(
+    size = 2, alpha = 0.25,
+    position = position_jitter(width = 0.2, height = 0),
+    aes(color = order_col, fill = order_col)
+  ) +
+
+  stat_summary(
+    fun = mean,
+    geom = "point",
+    aes(color = order_col),
+    size = 4, stroke = 1
+  ) +
+
+  annotate(
+    "text",
+    x = -Inf, y = Inf,
+    label = paste0("Mean = ", round(mean_overall_unique, 2), "%"),
+    hjust = -0.1, vjust = 1.5,
+    size = 6, color = "black", fontface = "bold"
+  ) +
+  
+  scale_color_manual(values = custom_colors) +
+  scale_fill_manual(values = custom_colors) +
+  
+  scale_y_continuous(expand = c(0.05, 0.05)) +
+  labs(x = NULL, y = "Mean completeness (%)") +
+  
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(size = 14, color = "black", face = "bold", angle = 45, hjust = 1),
+    axis.text.y = element_text(size = 18, color = "black"),
+    axis.title.y = element_text(size = 20, color = "black"),
+    panel.grid = element_blank(),
+    legend.key = element_rect(fill = "transparent"),
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 30),
+    legend.position = "none"
+  ) +
+  ggtitle("Unambiguous sequences")
+
+mean_coverage_per_taxon_unique
+
+```
+
+**Save the data**:
+
+```{r}
+
+save_figure(mean_coverage_per_taxon_all, "Fig1b_completeness_by_order_all", width = 6.9, height = 7.5)
+save_figure(mean_coverage_per_taxon_unique, "Fig1b_completeness_by_order_unambiguous", width = 6.9, height = 7.5)
+
+```
+
+**Clean the environment:**
+
+```{r}
+
+# Remove unnecessary data objects
+
+rm(mean_overall_percentage_all)
+rm(mean_overall_percentage_unique)
+rm(sd_overall_percentage_all)
+rm(sd_overall_percentage_unique)
+rm(custom_colors)
+rm(factor_levels)
+rm(mean_overall_all)
+rm(mean_overall_unique)
+rm(orders)
+rm(orders_unique)
+rm(palette_3)
+rm(palette_4)
+rm(primer_colors)
+rm(region_levels)
+rm(make_depth_plot)
+rm(primer_coverage_per_depth_all)
+rm(primer_coverage_per_depth_unique)
+rm(mean_coverage_per_taxon_all)
+rm(mean_coverage_per_taxon_unique)
+rm(mean_by_threshold)
+rm(mean_by_threshold_unique)
+rm(brz_mam_primer_completeness_all)
+rm(brz_mam_primer_completeness_unique)
+rm(brz_mam_primer_completeness_depth_all)
+rm(brz_mam_primer_completeness_depth_unique)
+rm(brz_summary_all)
+rm(brz_summary_unique)
+
+
+```
+
+### 1.2.5. ***Sequence ambiguity and divergence***
+
+***Number of species that share a sequence with another species:***
+
+```{r, fig.width=6, fig.height=8, fig.dpi=600}
+
+# 1. Prepare the data
+
+brz_mam_seq_sp_shared <- 
+  
+  brz_mam_sequences_all %>%
+  
+  filter(!is.na(sequence)) %>%
+  
+  group_by(primer, region) %>%
+  
+  mutate(total_species = n_distinct(binomial)) %>%
+  
+  ungroup() %>%
+  
+  distinct(primer, binomial, sequence, region, total_species) %>% 
+  # One row per species and sequence
+  
+  group_by(primer, region, sequence) %>%
+  
+  filter(n_distinct(binomial) > 1) %>%
+  
+  ungroup() %>%
+  
+  distinct(primer, binomial, region, total_species) %>%  
+  
+  group_by(primer, region) %>%
+  
+  summarise(total_shared_species = n_distinct(binomial), 
+            total_species = mean(total_species)) %>%
+  
+  mutate(percentage_shared_species = (total_shared_species / total_species)*100)
+
+
+brz_mam_seq_sp_shared$primer <- factor(brz_mam_seq_sp_shared$primer, 
+                                 levels = unique(brz_mam_seq_sp_shared$primer[order(brz_mam_seq_sp_shared$percentage_shared_species, decreasing = TRUE)]))
+
+mean_shared_species <- mean(brz_mam_seq_sp_shared$percentage_shared_species)
+sd_shared_species <- sd(brz_mam_seq_sp_shared$percentage_shared_species)
+
+# 2. Plot the data
+
+brz_mam_shared_sp_plot<- 
+  
+  ggplot(brz_mam_seq_sp_shared, aes(x = primer, y = percentage_shared_species)) +
+  
+  geom_rect(aes(xmin = -Inf, 
+                xmax = +Inf,
+                ymin = mean_shared_species - sd_shared_species,
+                ymax= mean_shared_species + sd_shared_species), 
+            color = "grey95",
+            fill = "grey95", 
+            alpha = 0.75)+
+  
+  geom_hline(yintercept = mean_shared_species, 
+             linewidth = 0.5, 
+             color = "grey30", 
+             linetype = "dashed")+
+  
+  geom_segment(aes(x= primer,
+                   xend=primer,
+                   y= percentage_shared_species,
+                   yend= mean_shared_species),
+               color="grey30",
+               linewidth = 0.5) +
+  
+  geom_point(shape = 21, 
+             size = 3, 
+             stroke = 1, 
+             alpha = 0.8, 
+             color = "grey30",
+             aes(fill = region)) + 
+  
+  scale_fill_manual(values = c("#68a898", "#b62c25", "#f6b332", "#2965a2"))+
+  
+  labs(title = "Percentage of species\nwith non-unique sequences (%)") +
+  
+  scale_y_continuous(limits = c(0, 100))+
+  
+  scale_x_discrete(labels = toupper) +
+  
+  theme_bw() + 
+  
+  
+  theme(
+    plot.background = element_rect(color = NA, fill = "white"),
+    panel.grid = element_blank(),
+    panel.grid.major.x = element_line(linewidth = 0.1, color = "grey75"),
+    plot.title = element_text(face = "bold", 
+                              size = 12, 
+                              hjust = 0.62),
+    plot.title.position = "plot",
+    plot.caption.position = "plot",
+    axis.title.y = element_blank(),
+    axis.text.y = element_text(hjust = 1, 
+                               margin = margin(r = 10), 
+                               face = "bold", 
+                               color = "black"), 
+    axis.ticks.y = element_blank(),
+    axis.text.x = element_text(size = 16, color = "black"),
+    axis.title.x = element_blank(),
+    plot.margin = margin(4, 4, 4, 4), 
+    legend.position = "none"
+  ) + 
+  
+  coord_flip()
+
+
+brz_mam_shared_sp_plot
+
+```
+
+***Number of species per shared sequence:***
+
+```{r, fig.width=6, fig.height=8, fig.dpi=600}
+
+# 1. Prepare the data
+
+brz_mam_seq_dupl <- 
+  
+  brz_mam_sequences_all %>% 
+  filter(!is.na(sequence)) %>%
+  group_by(primer, sequence, region) %>%
+  filter(n_distinct(binomial) > 1) %>%
+  summarise(n_species_shared = n_distinct(binomial), .groups = 'drop') %>%
+  arrange(primer, desc(n_species_shared)) %>%
+  group_by(primer) %>%
+  mutate(group_mean_n_species_shared = mean(n_species_shared))
+
+mean_n_species_shared <- mean(brz_mam_seq_dupl$n_species_shared)
+sd_n_species_shared <- sd(brz_mam_seq_dupl$n_species_shared)
+
+
+brz_mam_seq_dupl$primer <- factor(x = brz_mam_seq_dupl$primer, levels = levels(brz_mam_seq_sp_shared$primer))
+
+# Positions of the points, jittered to the left of each primer
+brz_mam_seq_dupl <- ungroup(brz_mam_seq_dupl)
+brz_mam_seq_dupl$point_x <- as.integer(brz_mam_seq_dupl$primer) - runif(nrow(brz_mam_seq_dupl), 0.05, 0.3)
+
+# 2. Plot the data
+
+
+brz_mam_n_shared_sp_plot <- 
+  
+  ggplot(brz_mam_seq_dupl, aes(x = as.integer(primer), 
+                            y = n_species_shared)) + 
+  
+  geom_rect(aes(xmin = -Inf, 
+                xmax = +Inf,
+                ymin = mean_n_species_shared - sd_n_species_shared,
+                ymax= mean_n_species_shared + sd_n_species_shared), 
+            color = "grey95",
+            fill = "grey95", 
+            alpha = 0.75)+
+  
+  geom_hline(yintercept = mean_n_species_shared, 
+             linetype = "dashed", 
+             linewidth = 0.5, 
+             color = "grey30")+
+  
+  geom_polygon(data = half_violin_polygons(brz_mam_seq_dupl, "primer", "n_species_shared"),
+               aes(x = x, y = y, group = group, fill = region, color = region),
+               alpha = 0.8, inherit.aes = FALSE) +
+
+  geom_point(aes(x = point_x, fill = region),
+             shape = 21, color = NA, alpha = .25, size = 1) +
+  
+  scale_color_manual(values = c("#68a898", "#b62c25", "#f6b332", "#2965a2"))+
+  scale_fill_manual(values = c("#68a898", "#b62c25", "#f6b332", "#2965a2"))+
+
+  geom_segment(aes(x = as.integer(primer),
+                   xend = as.integer(primer),
+                   y= group_mean_n_species_shared,
+                   yend= mean_n_species_shared),
+               color="grey30",
+               linewidth = 0.5) +
+  
+  stat_summary(geom = "point", fun = mean)+
+  
+  labs(title = "Number of shared species\nper duplicate sequence (# sp)")+
+  
+  scale_x_continuous(limits = c(0.5, nlevels(brz_mam_seq_dupl$primer) + 0.5),
+                     expand = expansion(add = 0.1)) +
+
+  coord_flip()+
+  
+  theme_bw() + 
+  
+  theme(
+    plot.background = element_rect(color = NA, fill = "white"),
+    panel.grid = element_blank(),
+    panel.grid.major.x = element_line(linewidth = 0.1, color = "grey75"),
+    plot.title = element_text(face = "bold", 
+                              size = 12, 
+                              hjust = 0.5, 
+                              color = "black"),
+    plot.title.position = "plot",
+    plot.caption.position = "plot",
+    axis.title.y = element_blank(),
+    axis.text.y = element_blank(), 
+    axis.ticks.y = element_blank(),
+    axis.text.x = element_text(size = 16, color = "black"),
+    axis.title.x = element_blank(),
+    plot.margin = margin(4, 4, 4, 4), 
+    legend.position = "none"
+  )
+
+brz_mam_n_shared_sp_plot
+
+
+```
+
+***Mean distance in amplicon sequences between species per primer:***
+
+```{r, fig.width=6, fig.height=8, fig.dpi=600}
+
+# 1. Prepare the data
+
+# Remove species without a sequence
+
+brz_mam_sequences_clean <- na.omit(brz_mam_sequences_all)
+
+# One representative sequence per species and primer: the medoid, i.e. the
+# sequence with the smallest summed distance to all other sequences of the
+# same species. This uses all sequences of a species without random sampling.
+# Ties are resolved alphabetically, the result does not depend on the input order.
+
+medoid_sequence <- function(seqs) {
+  seqs <- sort(unique(seqs))
+  if (length(seqs) == 1) return(seqs)
+  dist <- as.matrix(pwalign::stringDist(Biostrings::DNAStringSet(seqs), method = "levenshtein"))
+  seqs[which.min(rowSums(dist))]
+}
+
+brz_mam_seq_res <- brz_mam_sequences_clean %>%
+  group_by(primer, region, binomial) %>%
+  summarise(n_sequences = n_distinct(sequence),
+            sequence    = medoid_sequence(sequence),
+            .groups = "drop")
+
+# 2. Mean distance of each species to all other species, per primer
+
+brz_mam_seq_res <- brz_mam_seq_res %>%
+  group_by(primer) %>%
+  group_modify(function(d, key) {
+    dist <- as.matrix(pwalign::stringDist(Biostrings::DNAStringSet(d$sequence), method = "levenshtein"))
+    d$meandist <- rowSums(dist) / (nrow(dist) - 1)
+    d
+  }) %>%
+  ungroup()
+
+# Prepare additional variables
+
+brz_mam_seq_res <- 
+  
+  brz_mam_seq_res %>%
+  group_by(primer) %>%
+  mutate(mean_meandist = mean(meandist)) %>%
+  ungroup()%>%
+  arrange(desc(mean_meandist))
+  
+
+mean_overall_dist <- mean(brz_mam_seq_res$meandist)
+sd_overall_dist <- sd(brz_mam_seq_res$meandist)
+
+brz_mam_seq_res$primer <- factor(brz_mam_seq_res$primer,
+                                 levels = levels(brz_mam_seq_sp_shared$primer))
+
+# Positions of the points, jittered to the left of each primer
+
+set.seed(12345)
+brz_mam_seq_res$point_x <- as.integer(brz_mam_seq_res$primer) - runif(nrow(brz_mam_seq_res), 0.05, 0.3)
+
+# 3. Plot the data
+
+brz_mam_distance_plot<-
+  ggplot(brz_mam_seq_res, aes(x = as.integer(primer), 
+                            y = meandist)) + 
+  
+  geom_rect(aes(xmin = -Inf, 
+                xmax = +Inf,
+                ymin = mean_overall_dist - sd_overall_dist,
+                ymax= mean_overall_dist + sd_overall_dist), 
+            color = "grey95",
+            fill = "grey95", 
+            alpha = 0.75)+
+  
+  geom_hline(yintercept = mean_overall_dist, 
+             linetype = "dashed", 
+             linewidth = 0.5, 
+             color = "grey30")+
+  
+  geom_polygon(data = half_violin_polygons(brz_mam_seq_res, "primer", "meandist"),
+               aes(x = x, y = y, group = group, fill = region, color = region),
+               alpha = 0.8, inherit.aes = FALSE) +
+
+  geom_point(aes(x = point_x, color = region),
+             alpha = .1, size = .5) +
+  
+  scale_color_manual(values = c("#68a898", "#b62c25", "#f6b332", "#2965a2"))+
+  scale_fill_manual(values = c("#68a898", "#b62c25", "#f6b332", "#2965a2"))+
+
+  geom_segment(aes(x = as.integer(primer),
+                   xend = as.integer(primer),
+                   y= mean_meandist,
+                   yend= mean_overall_dist),
+               color="grey30",
+               linewidth = 0.5) +
+  
+  stat_summary(geom = "point", fun = mean)+
+  
+  labs(title = "Mean Levenshtein distance (bp)")+
+  
+  scale_x_continuous(limits = c(0.5, nlevels(brz_mam_seq_res$primer) + 0.5),
+                     expand = expansion(add = 0.1)) +
+
+  coord_flip()+
+  
+  theme_bw() + 
+  
+  theme(
+    plot.background = element_rect(color = NA, fill = "white"),
+    panel.grid = element_blank(),
+    panel.grid.major.x = element_line(linewidth = 0.1, color = "grey75"),
+    plot.title = element_text(face = "bold", 
+                              size = 12,
+                              color = "black",
+                              hjust = 0.5, 
+                              vjust = 0),
+    plot.title.position = "plot",
+    plot.caption.position = "plot",
+    axis.title.y = element_blank(),
+    axis.text.y = element_blank(), 
+    axis.ticks.y = element_blank(),
+    axis.text.x = element_text(size = 16, color = "black"),
+    axis.title.x = element_blank(),
+    plot.margin = margin(4, 4, 4, 4), 
+    legend.position = "none"
+  )
+
+brz_mam_distance_plot
+
+```
+
+**Combine plots:**
+
+These plots are combined into Fig. S13 (`FigS13_ambiguity_and_divergence_by_primer`).
+
+```{r, fig.height=7, fig.width=14}
+brz_species_ambiguity_plot <- 
+  brz_mam_shared_sp_plot + brz_mam_n_shared_sp_plot + brz_mam_distance_plot
+
+brz_species_ambiguity_plot
+```
+
+**Save the plots:**
+
+```{r}
+
+save_figure(brz_species_ambiguity_plot, "FigS13_ambiguity_and_divergence_by_primer",
+            width = 14, height = 7, type = "supplementary")
+
+```
+
+**Clean the environment:**
+
+```{r}
+rm(mean_shared_species)
+rm(sd_shared_species)
+rm(brz_mam_shared_sp_plot)
+rm(mean_n_species_shared)
+rm(sd_n_species_shared)
+rm(brz_mam_n_shared_sp_plot)
+rm(brz_mam_sequences_clean, medoid_sequence)
+```
+
+***Relationship between ambiguity and Levenshtein distance / amplicon length:***
+
+Create Figure 1D.
+
+```{r, fig.width=7, fig.height=7, dpi=600}
+
+# 1. Prepare the data
+
+# Ambiguity
+
+ambig_summary <-
+  brz_mam_seq_sp_shared %>%
+  select(primer, percentage_shared_species, region) %>%
+  distinct()
+
+# Levenshtein distance
+
+dist_summary <- 
+  brz_mam_seq_res %>%
+  select(primer, mean_meandist) %>%
+  distinct()
+
+# # Species per duplication
+
+dup_summary <- brz_mam_seq_dupl %>%
+  group_by(primer) %>%
+  summarise(max_species_per_dup = max(n_species_shared, na.rm = TRUE))
+
+# Mean barcode length
+
+length_summary <- 
+  brz_mam_sequences_all %>%
+  filter(!is.na(sequence)) %>%
+  group_by(primer) %>%
+  summarize(mean_length = mean(nchar(sequence), na.rm = TRUE))
+
+# Combine all summaries
+
+primer_summary <- 
+  ambig_summary %>%
+  left_join(dist_summary, by = "primer") %>%
+  left_join(length_summary, by = "primer")%>%
+  left_join(dup_summary, by = "primer")
+
+primer_summary <- primer_summary %>%
+  mutate(divergence = (mean_meandist / mean_length) * 100)
+
+
+# Compute Pearson correlation
+cor_test <- cor.test(primer_summary$divergence, 
+                     primer_summary$percentage_shared_species, 
+                     method = "pearson")
+
+# Prepare label text
+cor_label <- paste0(
+  "r = ", round(cor_test$estimate, 2),
+  ", p = ", signif(cor_test$p.value, 3)
+)
+
+# 2. Plot the data
+
+ambiguity_by_divergence <- 
+  
+  ggplot(primer_summary, aes(x = divergence, y = percentage_shared_species)) +
+  geom_point(aes(fill = region), shape = 21, size = 5, color = "black") +
+  geom_smooth(method = "lm", color = "black", se = FALSE, linetype = "dashed") +
+  geom_text(aes(label = primer), vjust = -1, size = 4, fontface = "bold", 
+            nudge_y = 1) +
+  scale_fill_manual(values = c("#68a898", "#b62c25", "#f6b332", "#2965a2")) +
+  labs(
+    x = "Mean divergent sites per barcode (%)",
+    y = "Species with ambiguous sequences (%)"
+  ) +
+  scale_y_continuous(expand = c(0.1, 0.1)) +
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(size = 14, color = "black", face = "bold"),
+    axis.text.y = element_text(size = 14, color = "black"),
+    axis.title.y = element_text(size = 16, color = "black"),
+    panel.grid = element_blank(),
+    legend.key = element_rect(fill = "transparent"),
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 30),
+    legend.position = "none"
+  ) +
+  # Add correlation
+  annotate("text", x = 30, y = 30, label = cor_label, size = 6, fontface = "bold")
+
+# 3. Save the plot
+
+save_figure(ambiguity_by_divergence, "Fig1d_ambiguity_vs_divergence", width = 7, height = 7)
+ambiguity_by_divergence
+
+```
+
+***Check the degree of ambiguity for each taxonomic clade-barcode combination:***
+
+Code used to produce Figure 1E.
+
+```{r, fig.height=7, fig.width=7, dpi = 600}
+
+# 1. Prepare the data
+
+# Identify ambiguous sequences (same sequence used by ≥2 species)
+
+ambig_seqs <- brz_mam_sequences_all %>%
+  left_join(brz_mam_taxonomy[, c("binomial", "order")], by = "binomial") %>%
+  filter(!is.na(sequence)) %>%
+  group_by(primer, sequence) %>%
+  filter(n_distinct(binomial) > 1) %>%         # ambiguous sequences
+  summarise(shared_species = list(unique(binomial)), .groups = "drop")
+
+# Unnest and restore species + clade information
+
+ambig_seqs_clade <- ambig_seqs %>%
+  unnest(shared_species) %>%
+  rename(binomial = shared_species) %>%
+  left_join(brz_mam_taxonomy[, c("binomial", "order")], by = "binomial")
+
+# Count ambiguous species per primer × clade
+
+ambig_summary <- ambig_seqs_clade %>%
+  group_by(primer, order) %>%
+  summarise(
+    n_ambig_species = n_distinct(binomial),
+    .groups = "drop"
+  )
+
+# Count total species per clade
+
+clade_sizes <- brz_mam_taxonomy %>%
+  group_by(order) %>%
+  summarise(n_species_in_clade = n_distinct(binomial), .groups = "drop")
+
+# Compute fraction ambiguous per primer × clade
+
+ambig_fraction <- ambig_summary %>%
+  left_join(clade_sizes, by = "order") %>%
+  mutate(fraction_ambiguous = n_ambig_species / n_species_in_clade)
+
+# Ensure all primer × clade combinations exist
+
+all_primers <- unique(brz_mam_sequences_all$primer)
+all_orders  <- unique(brz_mam_taxonomy$order)
+
+ambig_fraction <- ambig_fraction %>%
+  tidyr::complete(
+    primer = all_primers,
+    order = all_orders,
+    fill = list(
+      n_ambig_species = 0,
+      fraction_ambiguous = 0
+    )
+  )
+
+# Reorder factors for plotting
+
+primer_means <- ambig_fraction %>%
+  group_by(primer) %>%
+  summarise(mean_fraction = mean(fraction_ambiguous, na.rm = TRUE))
+
+clade_means <- ambig_fraction %>%
+  group_by(order) %>%
+  summarise(mean_fraction = mean(fraction_ambiguous, na.rm = TRUE))
+
+ambig_fraction <- ambig_fraction %>%
+  mutate(
+    primer = factor(primer, levels = rev(primer_means$primer[order(-primer_means$mean_fraction)])),
+    order  = factor(order,  levels = clade_means$order[order(-clade_means$mean_fraction)])
+  )
+
+
+# 2. Plot the data
+
+ambig_seq_per_primer_clade <- ggplot(ambig_fraction,
+                                     aes(x = order, y = primer, fill = fraction_ambiguous * 100)) +
+  
+  geom_tile(color = "black") +
+  
+  scale_fill_gradient(
+    low = "white",
+    high = "#440154FF",
+    na.value = "grey90",
+    limits = c(0, max(ambig_fraction$fraction_ambiguous, na.rm = TRUE) * 100)
+  ) +
+  
+  geom_text(
+    data = filter(ambig_fraction, fraction_ambiguous > 0),
+    aes(
+      label = paste0(round(fraction_ambiguous * 100, 1), "%"),
+      color = ifelse(
+        fraction_ambiguous > max(ambig_fraction$fraction_ambiguous, na.rm = TRUE) / 2,
+        "white", "black"
+      )
+    ),
+    size = 4.5,
+    fontface = "bold"
+  ) +
+  
+  scale_color_identity() +
+  labs(
+    x = "Clade (Order)",
+    y = "Primer",
+    fill = "Fraction ambiguous (%)",
+    title = "Percentage of Species with Ambiguous Barcodes"
+  ) +
+  
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid = element_blank(),
+    legend.position = "none",
+    plot.title = element_text(size = 18, face = "bold")
+  )
+
+
+# 3. Save the plot
+
+save_figure(ambig_seq_per_primer_clade, "Fig1e_ambiguity_by_order", width = 7, height = 7)
+ambig_seq_per_primer_clade
+
+```
+
+***Sources of sequence ambiguity:***
+
+Ambiguity can only be detected when both species that share a sequence have been sequenced. Differences in ambiguity between orders can therefore reflect real differences in how genetically similar species are, or differences in how well close relatives have been sequenced. We look at this in three ways, using all sequences of each species and the phylogenies from Part 1:
+
+1.  **Under-detection:** we randomly remove sequenced species, keeping 20% to 100% of them (100 times each), and recount the proportion of the remaining species affected by ambiguity. If ambiguity is under-detected when fewer species are sequenced, this proportion drops as fewer species are kept.
+2.  **Sequencing of the closest relative:** for each sequenced species, we check whether its sister species (its closest relative among the Brazilian mammals, based on the phylogenies averaged over the 100 trees) is also sequenced.
+3.  **Divergence between sister species:** for sister species that are both sequenced, we take the smallest distance between any of their sequences (Levenshtein distance, as a percentage of sequence length), and compare it with the time since they split in the phylogeny.
+
+Species grafted onto the phylogenies have an uncertain position, so we leave out species that were grafted, or whose sister species was grafted, from steps 2 and 3.
+
+If low ambiguity in some orders is caused by missing relatives, we expect sister species to be sequenced less often in those orders. If it is caused by real differences between species, we expect larger distances between sister species, even when both are sequenced.
+
+```{r, fig.width=14, fig.height=11}
+
+# 1. Phylogenetic distances between Brazilian species, averaged over the 100 trees
+
+tree_species <- sort(brz_mam_tree[[1]]$tip.label)
+
+phylo_dist <- Reduce(`+`, lapply(brz_mam_tree, function(tree) {
+  ape::cophenetic.phylo(tree)[tree_species, tree_species]
+})) / length(brz_mam_tree)
+
+diag(phylo_dist) <- NA
+
+# 2. Species grafted onto the trees, whose position is uncertain
+
+grafted_species <- brz_mam_tree[[1]]$graft_status %>%
+  mutate(species = gsub("_", " ", species)) %>%
+  filter(grepl("grafted", status)) %>%
+  pull(species)
+
+# 3. Sister species: the closest relative(s) of each species among the Brazilian species
+
+sister_table <- tibble(
+  binomial = tree_species,
+  sisters  = lapply(tree_species, function(sp) {
+    d <- phylo_dist[sp, ]
+    names(d)[which(abs(d - min(d, na.rm = TRUE)) < 1e-6)]
+  })
+) %>%
+  mutate(reliable = !(binomial %in% grafted_species) &
+           !sapply(sisters, function(s) any(s %in% grafted_species))) %>%
+  left_join(brz_mam_taxonomy[, c("binomial", "order")], by = "binomial")
+
+message(sum(!sister_table$reliable), " of ", nrow(sister_table),
+        " species left out because they or their sister species were grafted onto the trees")
+
+# 4. All sequences per species and primer
+
+seq_table <- brz_mam_sequences_all %>%
+  filter(!is.na(sequence)) %>%
+  distinct(primer, binomial, sequence)
+
+seq_lookup <- split(seq_table$sequence, paste(seq_table$primer, seq_table$binomial, sep = "|"))
+
+# 5. Sequencing of the closest relative: for each sequenced species and primer,
+#    whether at least one of its sister species is also sequenced
+
+sister_sampling <- seq_table %>%
+  distinct(primer, binomial) %>%
+  inner_join(filter(sister_table, reliable), by = "binomial") %>%
+  group_by(primer) %>%
+  mutate(sister_sequenced = sapply(sisters, function(s) any(s %in% binomial))) %>%
+  ungroup()
+
+# 6. Divergence between sister species: the smallest distance between any
+#    sequence of one species and any sequence of its sister (% of sequence length)
+
+min_sequence_distance <- function(seqs_a, seqs_b) {
+  dist <- as.matrix(pwalign::stringDist(Biostrings::DNAStringSet(c(seqs_a, seqs_b)),
+                                        method = "levenshtein"))
+  dist <- dist[seq_along(seqs_a), length(seqs_a) + seq_along(seqs_b), drop = FALSE]
+  seq_length <- outer(nchar(seqs_a), nchar(seqs_b), "+") / 2
+  min(dist / seq_length) * 100
+}
+
+sister_pairs <- sister_sampling %>%
+  filter(sister_sequenced) %>%
+  select(primer, binomial, order, sisters) %>%
+  tidyr::unnest_longer(sisters, values_to = "sister") %>%
+  filter(paste(primer, sister, sep = "|") %in% names(seq_lookup)) %>%
+  mutate(pair = ifelse(binomial < sister,
+                       paste(binomial, sister, sep = " | "),
+                       paste(sister, binomial, sep = " | "))) %>%
+  distinct(primer, pair, .keep_all = TRUE)
+
+sister_pairs$distance <- mapply(function(p, a, b) {
+  min_sequence_distance(seq_lookup[[paste(p, a, sep = "|")]],
+                        seq_lookup[[paste(p, b, sep = "|")]])
+}, sister_pairs$primer, sister_pairs$binomial, sister_pairs$sister)
+
+sister_pairs$divergence_time <- phylo_dist[cbind(sister_pairs$binomial, sister_pairs$sister)] / 2
+
+# One value per sister pair: the median distance across primers, and whether
+# the pair shares an identical sequence for at least one primer
+
+pair_summary <- sister_pairs %>%
+  group_by(pair, order) %>%
+  summarise(median_distance = median(distance),
+            ambiguous       = any(distance == 0),
+            n_primers       = n(),
+            divergence_time = first(divergence_time),
+            .groups = "drop")
+
+save_table(pair_summary, "sister_pair_distances", type = "additional")
+
+# 7. Under-detection: randomly keep 20-100% of the sequenced species per primer
+#    and recount the proportion of the kept species affected by ambiguity
+
+ambiguous_species <- function(tab) {
+  counts <- table(tab$sequence)
+  unique(tab$binomial[tab$sequence %in% names(counts)[counts > 1]])
+}
+
+order_lookup  <- setNames(brz_mam_taxonomy$order, brz_mam_taxonomy$binomial)
+seq_by_primer <- split(seq_table[, c("binomial", "sequence")], seq_table$primer)
+retained      <- c(0.2, 0.4, 0.6, 0.8, 1)
+n_reps        <- 100
+
+set.seed(12345)
+
+subsampling <- bind_rows(lapply(retained, function(f) {
+  bind_rows(lapply(seq_len(if (f == 1) 1 else n_reps), function(r) {
+    bind_rows(lapply(names(seq_by_primer), function(p) {
+      tab     <- seq_by_primer[[p]]
+      species <- unique(tab$binomial)
+      kept    <- sample(species, round(f * length(species)))
+      amb     <- ambiguous_species(tab[tab$binomial %in% kept, ])
+      tibble(retained = f, rep = r, primer = p,
+             order = unname(order_lookup[kept]), ambiguous = kept %in% amb)
+    }))
+  }))
+}))
+
+subsampling_summary <- subsampling %>%
+  group_by(order, retained, rep) %>%
+  summarise(fraction_ambiguous = mean(ambiguous), .groups = "drop") %>%
+  group_by(order, retained) %>%
+  summarise(median = median(fraction_ambiguous) * 100,
+            lower  = quantile(fraction_ambiguous, 0.025) * 100,
+            upper  = quantile(fraction_ambiguous, 0.975) * 100,
+            .groups = "drop")
+
+# 8. Summary per order (orders with at least 10 species)
+
+main_orders <- brz_mam_taxonomy %>%
+  count(order) %>%
+  filter(n >= 10) %>%
+  pull(order)
+
+ambiguity_sources_by_order <- subsampling_summary %>%
+  filter(retained %in% c(0.2, 1)) %>%
+  select(order, retained, median) %>%
+  tidyr::pivot_wider(names_from = retained, values_from = median,
+                     names_prefix = "percent_ambiguous_kept_") %>%
+  rename(percent_ambiguous = percent_ambiguous_kept_1,
+         percent_ambiguous_at_20 = percent_ambiguous_kept_0.2) %>%
+  left_join(sister_sampling %>%
+              group_by(order) %>%
+              summarise(percent_sister_sequenced = mean(sister_sequenced) * 100,
+                        n_species_with_reliable_sister = n_distinct(binomial),
+                        .groups = "drop"),
+            by = "order") %>%
+  left_join(pair_summary %>%
+              group_by(order) %>%
+              summarise(n_sister_pairs           = n(),
+                        median_sister_distance   = median(median_distance),
+                        percent_pairs_ambiguous  = mean(ambiguous) * 100,
+                        median_divergence_time   = median(divergence_time),
+                        .groups = "drop"),
+            by = "order") %>%
+  filter(order %in% main_orders) %>%
+  arrange(desc(percent_ambiguous))
+
+ambiguity_sources_by_order
+
+save_table(ambiguity_sources_by_order, "ambiguity_sources_by_order", type = "additional")
+
+# 9. Plot
+
+order_levels <- ambiguity_sources_by_order$order
+
+order_colors <- c(
+  "Didelphimorphia" = "#92ad88",
+  "Cingulata"       = "#73968d",
+  "Pilosa"          = "#e8ccad",
+  "Primates"        = "#e3a88c",
+  "Rodentia"        = "#cc9ea5",
+  "Artiodactyla"    = "#9ba3c8",
+  "Carnivora"       = "#94a7b8",
+  "Chiroptera"      = "#80a0a6"
+)
+
+theme_ambiguity <- theme_classic(base_size = 12) +
+  theme(axis.text  = element_text(colour = "black"),
+        axis.title = element_text(colour = "black"),
+        legend.title = element_blank())
+
+# a) Proportion affected by ambiguity when fewer species are sequenced
+
+p_subsampling <- subsampling_summary %>%
+  filter(order %in% main_orders) %>%
+  mutate(order = factor(order, levels = order_levels)) %>%
+  ggplot(aes(x = retained * 100, y = median, colour = order, fill = order)) +
+  geom_ribbon(aes(ymin = lower, ymax = upper), alpha = 0.15, colour = NA) +
+  geom_line(linewidth = 0.8) +
+  geom_point(size = 2) +
+  scale_colour_manual(values = order_colors) +
+  scale_fill_manual(values = order_colors) +
+  labs(x = "Sequenced species kept (%)",
+       y = "Species affected by ambiguity (% of kept species)") +
+  theme_ambiguity+
+  theme(axis.title.x = element_text(margin = margin(t = 0.5)))
+
+# b) Sequencing of the closest relative
+
+p_sister_sampling <- sister_sampling %>%
+  filter(order %in% main_orders) %>%
+  group_by(primer, order) %>%
+  summarise(percent_sister_sequenced = mean(sister_sequenced) * 100, .groups = "drop") %>%
+  mutate(order = factor(order, levels = order_levels)) %>%
+  ggplot(aes(x = order, y = percent_sister_sequenced, fill = order)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.6) +
+  geom_jitter(width = 0.15, size = 1.5, alpha = 0.6) +
+  scale_fill_manual(values = order_colors) +
+  scale_y_continuous(limits = c(0, 100)) +
+  labs(x = NULL, y = "Species with a sequenced sister species (%)") +
+  theme_ambiguity +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1), legend.position = "none")
+
+# c) Divergence between sister species
+
+p_sister_distance <- pair_summary %>%
+  filter(order %in% main_orders) %>%
+  mutate(order = factor(order, levels = order_levels)) %>%
+  ggplot(aes(x = order, y = median_distance, fill = order)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.6) +
+  geom_jitter(width = 0.15, size = 1.5, alpha = 0.6) +
+  scale_fill_manual(values = order_colors) +
+  labs(x = NULL, y = "Sequence distance between sister species (%)") +
+  theme_ambiguity +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1), legend.position = "none")
+
+# d) Sequence distance against time since the split
+
+p_distance_time <- pair_summary %>%
+  filter(order %in% main_orders) %>%
+  mutate(order = factor(order, levels = order_levels),
+         ambiguous = ifelse(ambiguous, "Shared sequence", "No shared sequence")) %>%
+  ggplot(aes(x = divergence_time, y = median_distance, colour = order, shape = ambiguous)) +
+  geom_point(size = 2.2, alpha = 0.8) +
+  scale_x_log10() +
+  scale_colour_manual(values = order_colors) +
+  scale_shape_manual(values = c("Shared sequence" = 17, "No shared sequence" = 16)) +
+  labs(x = "Time since split from sister species (million years, log scale)",
+       y = "Sequence distance between sister species (%)") +
+  guides(colour = "none") +
+  theme_ambiguity
+
+ambiguity_sources_plot <- (p_subsampling | p_sister_sampling) /
+  (p_sister_distance | p_distance_time) +
+  plot_layout(guides = "collect") +
+  plot_annotation(tag_levels = "a")
+
+ambiguity_sources_plot
+
+save_figure(ambiguity_sources_plot, "FigS14_sources_of_sequence_ambiguity",
+            width = 14, height = 11, type = "supplementary")
+
+# Values used in the interpretation below
+
+n_excluded <- sum(!sister_table$reliable)
+
+val <- function(ord, col) {
+  round(ambiguity_sources_by_order[[col]][ambiguity_sources_by_order$order == ord], 1)
+}
+
+val_range <- function(ords, col) {
+  x <- round(range(ambiguity_sources_by_order[[col]][ambiguity_sources_by_order$order %in% ords]), 1)
+  paste0(x[1], "–", x[2])
+}
+
+rm(tree_species, phylo_dist, grafted_species, sister_table, seq_table, seq_lookup,
+   sister_sampling, min_sequence_distance, sister_pairs, pair_summary, ambiguous_species,
+   order_lookup, seq_by_primer, retained, n_reps, subsampling, subsampling_summary,
+   main_orders, order_levels, order_colors, theme_ambiguity, p_subsampling,
+   p_sister_sampling, p_sister_distance, p_distance_time, ambiguity_sources_plot,
+   brz_mam_tree)
+
+```
+
+The table `ambiguity_sources_by_order` summarises the three analyses per order. Points in panels b and c show individual primers and sister pairs, respectively.
+
+> **Interpretation**: When we keep fewer of the sequenced species, the proportion affected by ambiguity drops in every order (panel A). In primates, it falls from `r val("Primates", "percent_ambiguous")`% with all sequenced species to `r val("Primates", "percent_ambiguous_at_20")`% with 20% of them, and in rodents from `r val("Rodentia", "percent_ambiguous")`% to `r val("Rodentia", "percent_ambiguous_at_20")`%. Ambiguity is therefore under-detected when fewer species are sequenced, and the current values reported in the main text are likely underestimates.
+>
+> Sister species are sequenced less often in rodents, bats and didelphid marsupials (`r val_range(c("Rodentia", "Chiroptera", "Didelphimorphia"), "percent_sister_sequenced")`% of sequenced species have a sequenced sister species) than in carnivores, artiodactylans, sloths and anteaters, and armadillos (`r val_range(c("Carnivora", "Artiodactyla", "Pilosa", "Cingulata"), "percent_sister_sequenced")`%; panel B). Primates are in between (`r val("Primates", "percent_sister_sequenced")`%), yet have by far the most ambiguity, so missing relatives do not explain the differences between orders on their own.
+>
+> When both sister species are sequenced, their sequences differ much less in primates and artiodactylans (median `r val("Primates", "median_sister_distance")`% and `r val("Artiodactyla", "median_sister_distance")`%) than in rodents, bats, carnivores and didelphid marsupials (`r val_range(c("Rodentia", "Chiroptera", "Carnivora", "Didelphimorphia"), "median_sister_distance")`%; panel C). This also holds for sister species that split at similar times (panel D). High ambiguity in primates and artiodactylans therefore reflects closely related species with very similar mitochondrial sequences, while lower ambiguity in rodents, bats and didelphid marsupials reflects both greater differences between species and incomplete sequencing of close relatives.
+>
+> `r n_excluded` of 731 species were left out of panels B–D because they or their sister species were grafted onto the phylogenies. Grafted species are often recently described or split, which are the species most likely to share sequences, so panels B–D may underestimate ambiguity. Artiodactyla, Pilosa and Cingulata have few sister pairs, so their values in panels C and D are indicative only.
+
+```{r}
+
+rm(n_excluded, val, val_range, ambiguity_sources_by_order)
+
+```
+
+**Clean the environment:**
+
+```{r}
+# Remove objects no longer needed
+
+rm(brz_mam_distance_plot)
+rm(brz_mam_seq_dupl)
+rm(brz_mam_seq_res)
+rm(brz_mam_seq_sp_shared)
+rm(brz_species_ambiguity_plot)
+rm(mean_overall_dist)
+rm(sd_overall_dist)
+rm(ambig_fraction)
+rm(ambig_seqs)
+rm(ambig_seqs_clade)
+rm(ambig_summary)
+rm(ambiguity_by_divergence)
+rm(ambig_seq_per_primer_clade)
+rm(clade_means)
+rm(clade_sizes)
+rm(cor_test)
+rm(dist_summary)
+rm(dup_summary)
+rm(length_summary)
+rm(primer_means)
+rm(primer_summary)
+rm(all_orders)
+rm(all_primers)
+rm(cor_label)
+```
+
+### 1.2.6. ***Lowest, mean and highest completeness per order***
+
+Code to prepare Figure 2A.
+
+```{r}
+
+# 1. Plot the data
+
+custom_colors <- c(
+  "Didelphimorphia" = "#92ad88", 
+  "Lagomorpha" = "#b5bd7e",
+  "Sirenia" = "#d8a4d5",
+  "Cingulata" = "#73968d",
+  "Pilosa" = "#e8ccad",
+  "Primates" = "#e3a88c",
+  "Rodentia" = "#cc9ea5",
+  "Artiodactyla" = "#9ba3c8",
+  "Carnivora" = "#94a7b8",
+  "Chiroptera" = "#80a0a6",
+  "Perissodactyla" = "#cbc29d")
+
+min_mean_max_per_clade_all <- 
+  
+  brz_mam_clade_primer_completeness_all %>%
+  
+  select(order, primer, cumsum, region) %>%
+  
+  unique() %>%
+  
+  group_by(order) %>%
+  
+  summarise(
+    max_value = max(cumsum, na.rm = TRUE),
+    max_primer = if_else(sum(cumsum == max_value) > 1, 
+                         "multiple", 
+                         primer[which.max(cumsum)]),
+    
+    min_value = min(cumsum, na.rm = TRUE),
+    
+    min_primer = if_else(sum(cumsum == min_value) > 1, 
+                         "multiple", 
+                         primer[which.min(cumsum)]),
+    
+    mean_value = mean(cumsum, na.rm = TRUE)) %>%
+  
+  ungroup() %>%
+  
+  mutate(order = factor(order, levels = order[order(max_value)])) %>%
+  
+  ggplot() +
+  geom_segment(aes(x = order, xend = order, y = min_value, yend = max_value, 
+                   color = order), linewidth = 1) +  # vertical line
+  geom_point(aes(x = order, y = max_value, color = order, fill = order), shape = 24, size = 4) +  # max dot
+  geom_point(aes(x = order, y = min_value, color = order, fill = order), shape = 25, size = 4) +  # min dot
+  geom_point(aes(x = order, y = mean_value, fill = order, color = order), shape = 21, size = 4) +     # mean dot
+  geom_text(aes(x = order, y = max_value, label = max_primer), vjust = -0.7, hjust = 0.5, color = "black", size = 3, nudge_y = 3) +
+  geom_text(aes(x = order, y = min_value, label = min_primer), vjust = 1.5, hjust = 0.5, color = "black", size = 3, nudge_y = -3) +
+  labs(
+    x = NULL,
+    y = "Species with barcode (%)",
+    title = "All sequences",
+  ) +
+  
+  scale_color_manual(values = custom_colors) +
+  
+  scale_fill_manual(values = custom_colors) +
+  
+  scale_y_continuous(expand = c(0.1, 0.1), limits = c(0,100)) +
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(size = 14, color = "black", face = "bold", angle = 45, hjust = 1),
+    axis.text.y = element_text(size = 18, color = "black"),
+    axis.title.y = element_text(size = 20, color = "black"),
+    panel.grid = element_blank(),
+    legend.key = element_rect(fill = "transparent"),
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 30),
+    legend.position = "none"
+  )
+
+min_mean_max_per_clade_all
+
+min_mean_max_per_clade_unique <- 
+  
+  brz_mam_clade_primer_completeness_unique %>%
+  
+  select(order, primer, cumsum, region) %>%
+  
+  unique() %>%
+  
+  group_by(order) %>%
+  
+  summarise(
+    max_value = max(cumsum, na.rm = TRUE),
+    max_primer = if_else(sum(cumsum == max_value) > 1, 
+                         "multiple", 
+                         primer[which.max(cumsum)]),
+    
+    min_value = min(cumsum, na.rm = TRUE),
+    
+    min_primer = if_else(sum(cumsum == min_value) > 1, 
+                         "multiple", 
+                         primer[which.min(cumsum)]),
+    
+    mean_value = mean(cumsum, na.rm = TRUE)) %>%
+  
+  ungroup() %>%
+  
+  mutate(order = factor(order, levels = order[order(max_value)])) %>%
+  
+ ggplot() +
+  geom_segment(aes(x = order, xend = order, y = min_value, yend = max_value, 
+                   color = order), linewidth = 1) +  # vertical line
+  geom_point(aes(x = order, y = max_value, color = order, fill = order), shape = 24, size = 4) +  # max dot
+  geom_point(aes(x = order, y = min_value, color = order, fill = order), shape = 25, size = 4) +  # min dot
+  geom_point(aes(x = order, y = mean_value, fill = order, color = order), shape = 21, size = 4) +     # mean dot
+  geom_text(aes(x = order, y = max_value, label = max_primer), vjust = -0.7, hjust = 0.5, color = "black", size = 3, nudge_y = 3) +
+  geom_text(aes(x = order, y = min_value, label = min_primer), vjust = 1.5, hjust = 0.5, color = "black", size = 3, nudge_y = -3) +
+  labs(
+    x = NULL,
+    y = "Species with barcode (%)",
+    title = "Unambiguous sequences",
+  ) +
+  
+  scale_color_manual(values = custom_colors) +
+  
+  scale_fill_manual(values = custom_colors) +
+  
+  scale_y_continuous(expand = c(0.1, 0.1), limits = c(0,100)) +
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(size = 14, color = "black", face = "bold", angle = 45, hjust = 1),
+    axis.text.y = element_text(size = 18, color = "black"),
+    axis.title.y = element_text(size = 20, color = "black"),
+    panel.grid = element_blank(),
+    legend.key = element_rect(fill = "transparent"),
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 30),
+    legend.position = "none"
+  )
+
+min_mean_max_per_clade_unique
+
+
+# 2. Save the plots
+
+
+save_figure(min_mean_max_per_clade_all, "Fig2a_completeness_range_by_order_all", width = 7, height = 7.6)
+save_figure(min_mean_max_per_clade_unique, "Fig2a_completeness_range_by_order_unambiguous", width = 7, height = 7.6)
+```
+
+### 1.2.7. ***Statistics reported in the main text***
+
+Values reported in the Results that cannot be read directly from Figures 1 and 2. All values are calculated from the species-level completeness tables and sequences, so they do not depend on the plotting objects above.
+
+```{r}
+
+# 1. Completeness per primer, for all and unambiguous sequences
+
+completeness_by_primer <- brz_mam_completeness_all %>%
+  group_by(region, primer) %>%
+  summarise(completeness_all = mean(presence) * 100, .groups = "drop") %>%
+  left_join(brz_mam_completeness_unique %>%
+              group_by(primer) %>%
+              summarise(completeness_unambiguous = mean(presence) * 100, .groups = "drop"),
+            by = "primer") %>%
+  arrange(desc(completeness_all))
+
+completeness_by_primer
+
+cat("Median completeness across primers:",
+    round(median(completeness_by_primer$completeness_all), 1), "% (all),",
+    round(median(completeness_by_primer$completeness_unambiguous), 1), "% (unambiguous)\n")
+
+# 2. Completeness per primer and order, and mean per order across primers
+
+order_size <- brz_mam_taxonomy %>%
+  count(order, name = "n_species")
+
+completeness_by_primer_order <- brz_mam_completeness_all %>%
+  left_join(brz_mam_taxonomy[, c("binomial", "order")], by = "binomial") %>%
+  group_by(order, region, primer) %>%
+  summarise(completeness_all = mean(presence) * 100, .groups = "drop") %>%
+  left_join(brz_mam_completeness_unique %>%
+              left_join(brz_mam_taxonomy[, c("binomial", "order")], by = "binomial") %>%
+              group_by(order, primer) %>%
+              summarise(completeness_unambiguous = mean(presence) * 100, .groups = "drop"),
+            by = c("order", "primer"))
+
+save_table(completeness_by_primer_order, "completeness_by_primer_and_order", type = "additional")
+
+# Loss of effective coverage: difference between all and unambiguous sequences,
+# in percentage points and relative to the completeness for all sequences
+
+completeness_by_order <- completeness_by_primer_order %>%
+  group_by(order) %>%
+  summarise(mean_completeness_all         = mean(completeness_all),
+            mean_completeness_unambiguous = mean(completeness_unambiguous),
+            .groups = "drop") %>%
+  mutate(loss_percentage_points = mean_completeness_all - mean_completeness_unambiguous,
+         loss_relative_percent  = loss_percentage_points / mean_completeness_all * 100) %>%
+  left_join(order_size, by = "order") %>%
+  arrange(desc(mean_completeness_all))
+
+completeness_by_order
+
+cat("Overall mean completeness across orders:",
+    round(mean(completeness_by_order$mean_completeness_all), 1), "% (all),",
+    round(mean(completeness_by_order$mean_completeness_unambiguous), 1), "% (unambiguous)\n")
+
+# 3. Sequence ambiguity: species with at least one sequence shared with another species
+
+ambiguity_by_species <- brz_mam_sequences_all %>%
+  filter(!is.na(sequence)) %>%
+  distinct(region, primer, binomial, sequence) %>%
+  group_by(primer, sequence) %>%
+  mutate(shared = n_distinct(binomial) > 1) %>%
+  group_by(region, primer, binomial) %>%
+  summarise(ambiguous = any(shared), .groups = "drop") %>%
+  left_join(brz_mam_taxonomy[, c("binomial", "order")], by = "binomial")
+
+# Per primer, as a percentage of species with at least one sequence
+
+ambiguity_by_primer <- ambiguity_by_species %>%
+  group_by(region, primer) %>%
+  summarise(n_sequenced = n(),
+            n_ambiguous = sum(ambiguous),
+            percent_ambiguous = n_ambiguous / n_sequenced * 100,
+            .groups = "drop") %>%
+  arrange(desc(percent_ambiguous))
+
+ambiguity_by_primer
+
+cat("Species affected by ambiguity per primer:",
+    round(min(ambiguity_by_primer$percent_ambiguous), 1), "-",
+    round(max(ambiguity_by_primer$percent_ambiguous), 1), "% of sequenced species\n")
+
+# Per primer and order, as a percentage of sequenced species and of all species in the order
+
+ambiguity_by_primer_order <- ambiguity_by_species %>%
+  group_by(order, region, primer) %>%
+  summarise(n_sequenced = n(),
+            n_ambiguous = sum(ambiguous),
+            .groups = "drop") %>%
+  left_join(order_size, by = "order") %>%
+  mutate(percent_of_sequenced = n_ambiguous / n_sequenced * 100,
+         percent_of_all       = n_ambiguous / n_species * 100)
+
+save_table(ambiguity_by_primer_order, "ambiguity_by_primer_and_order", type = "additional")
+
+ambiguity_max_by_order <- ambiguity_by_primer_order %>%
+  group_by(order) %>%
+  summarise(max_percent_of_sequenced = max(percent_of_sequenced),
+            max_percent_of_all       = max(percent_of_all),
+            primer_at_max            = primer[which.max(percent_of_all)],
+            .groups = "drop") %>%
+  arrange(desc(max_percent_of_all))
+
+ambiguity_max_by_order
+
+# 4. Haplotypic depth: percentage of species with at least 1, 2, 5 and 10
+#    distinct sequences, per primer and summarised across primers
+
+depth_thresholds <- c(1, 2, 5, 10)
+
+depth_by_primer <- bind_rows(
+  brz_mam_completeness_all %>% mutate(sequences = "all"),
+  brz_mam_completeness_unique %>% mutate(sequences = "unambiguous")
+) %>%
+  tidyr::crossing(threshold = depth_thresholds) %>%
+  group_by(sequences, primer, threshold) %>%
+  summarise(percent_species = mean(nseq >= threshold) * 100, .groups = "drop")
+
+depth_summary <- depth_by_primer %>%
+  group_by(sequences, threshold) %>%
+  summarise(mean_percent   = mean(percent_species),
+            median_percent = median(percent_species),
+            min_percent    = min(percent_species),
+            max_percent    = max(percent_species),
+            .groups = "drop")
+
+depth_summary
+
+# Species with fewer than two sequences, averaged across primers
+
+cat("Species with fewer than two sequences (mean across primers):",
+    round(100 - depth_summary$mean_percent[depth_summary$sequences == "all" & depth_summary$threshold == 2], 1),
+    "%\n")
+
+rm(order_size, ambiguity_by_species, depth_thresholds, depth_by_primer)
+
+```
+
+The full tables per primer and order are saved in `output/tables/additional/` (`completeness_by_primer_and_order`, `ambiguity_by_primer_and_order`). "Loss of effective coverage" is given both in percentage points (`loss_percentage_points`) and relative to the completeness for all sequences (`loss_relative_percent`); the Results report percentage points.
+
+```{r}
+
+rm(completeness_by_primer, completeness_by_primer_order, completeness_by_order,
+   ambiguity_by_primer, ambiguity_by_primer_order, ambiguity_max_by_order, depth_summary)
+
+```
+
+## 1.3. Explore database complementarity
+
+### 1.3.1. ***Completeness of primer pairs, overall and per order***
+
+Code used to produce Figure 2B.
+
+**Prepare the data:**
+
+```{r}
+
+# 1. Step 1: Add "All" class and merge clade-specific orders
+
+#    - Create a copy of all sequences
+#    - Add a pseudo-clade "All"
+#    - Merge with taxonomy to include real orders for each species
+
+brz_mam_sequences_class <- brz_mam_sequences_all
+brz_mam_sequences_class$order <- c("All")
+
+brz_mam_sequences_class <- rbind(
+  brz_mam_sequences_class, 
+  merge(brz_mam_sequences_all, brz_mam_taxonomy[, c("binomial", "order")], by = "binomial")
+)
+
+# 2. Step 2: Separate sequences per clade and handle duplicates
+
+#    - For each clade, calculate number of sequences per primer per species (nseq_all)
+#    - Identify sequences shared among multiple species and set them as NA
+#    - Calculate number of unique sequences per primer per species (nseq_unique)
+
+orders <- unique(brz_mam_sequences_class$order)
+brz_mam_sequences_class_list <- vector("list", length(orders))
+
+for (i in 1:length(orders)) {
+  brz_mam_sequences_class_list[[i]] <- brz_mam_sequences_class[brz_mam_sequences_class$order == orders[i], ] %>%
+    
+    group_by(primer, binomial) %>%
+    mutate(nseq_all = n_distinct(sequence, na.rm = TRUE)) %>%
+    ungroup() %>%
+    
+    group_by(primer, sequence) %>%
+    mutate(sequence = ifelse(n_distinct(binomial) > 1, NA, sequence)) %>%
+    ungroup() %>%
+    
+    group_by(primer, binomial) %>%
+    mutate(nseq_unique = n_distinct(sequence, na.rm = TRUE)) %>%
+    select(!sequence) %>%
+    unique()
+}
+
+names(brz_mam_sequences_class_list) <- orders
+
+# 3. Step 3: Pivot wider to create binary matrices for primers per species
+
+#    - For all sequences (nseq_all) and unique sequences (nseq_unique)
+#    - Convert counts to logical TRUE/FALSE (presence/absence)
+
+brz_mam_sequences_all_class_list <- vector("list", length(brz_mam_sequences_class_list))
+brz_mam_sequences_unique_class_list <- vector("list", length(brz_mam_sequences_class_list))
+
+for (i in 1:length(brz_mam_sequences_all_class_list)) {
+  
+  # Pivot all sequences
+  brz_mam_sequences_all_class_list[[i]] <- brz_mam_sequences_class_list[[i]] %>%
+    select(binomial, primer, nseq_all) %>%
+    tidyr::pivot_wider(names_from = primer, values_from = nseq_all)
+  
+  brz_mam_sequences_all_class_list[[i]][sapply(brz_mam_sequences_all_class_list[[i]], is.numeric)] <- 
+    lapply(brz_mam_sequences_all_class_list[[i]][sapply(brz_mam_sequences_all_class_list[[i]], is.numeric)], function(x) x > 0)
+  
+  # Pivot unique sequences
+  brz_mam_sequences_unique_class_list[[i]] <- brz_mam_sequences_class_list[[i]] %>%
+    select(binomial, primer, nseq_unique) %>%
+    tidyr::pivot_wider(names_from = primer, values_from = nseq_unique)
+  
+  brz_mam_sequences_unique_class_list[[i]][sapply(brz_mam_sequences_unique_class_list[[i]], is.numeric)] <- 
+    lapply(brz_mam_sequences_unique_class_list[[i]][sapply(brz_mam_sequences_unique_class_list[[i]], is.numeric)], function(x) x > 0)
+}
+
+# 4. Step 4: Generate all unique pairs of primers for pairwise comparisons
+
+primer_pairs <- as.data.frame(t(combn(unique(brz_mam_sequences_all$primer), 2)))
+colnames(primer_pairs) <- c("primer1", "primer2")
+
+# 5. Step 5: Calculate individual primer performance
+
+#    - % of species covered by each primer for all sequences and unique sequences
+
+primer_performance <- vector("list", length(brz_mam_sequences_all_class_list))
+
+for (i in 1:length(primer_performance)) {
+  primer_performance[[i]] <- data.frame(
+    primer = toupper(colnames(brz_mam_sequences_all_class_list[[i]][, 2:ncol(brz_mam_sequences_all_class_list[[i]])])),
+    performance_all = apply(
+      brz_mam_sequences_all_class_list[[i]][, 2:ncol(brz_mam_sequences_all_class_list[[i]])], 
+      2, 
+      function(x) (sum(x)/length(unique(brz_mam_sequences_all_class_list[[i]]$binomial))*100)
+    ),
+    performance_unique = apply(
+      brz_mam_sequences_unique_class_list[[i]][, 2:ncol(brz_mam_sequences_unique_class_list[[i]])], 
+      2, 
+      function(x) (sum(x)/length(unique(brz_mam_sequences_unique_class_list[[i]]$binomial))*100)
+    )
+  )
+}
+
+# 6. Step 6: Compute pairwise performance between primers
+
+#    - For each primer pair, determine species covered by either primer
+
+brz_mam_multi_primer_clade_all <- vector("list", length(brz_mam_sequences_all_class_list))
+brz_mam_multi_primer_clade_unique <- vector("list", length(brz_mam_sequences_unique_class_list))
+
+for (i in 1:length(brz_mam_multi_primer_clade_all)) {
+  
+  brz_mam_multi_primer_clade_all[[i]] <- vector("list")
+  brz_mam_multi_primer_clade_unique[[i]] <- vector("list")
+  
+  for (j in 1:nrow(primer_pairs)) {
+    
+    primer1 <- as.character(primer_pairs[j, "primer1"][[1]])
+    primer2 <- as.character(primer_pairs[j, "primer2"][[1]])
+    
+    # All sequences
+    brz_mam_multi_primer_clade_all[[i]][[j]] <- brz_mam_sequences_all_class_list[[i]] %>%
+      mutate(
+        seq_both = .data[[primer1]] | .data[[primer2]],
+        primer_comb = toupper(paste0(primer1, " - ", primer2)),
+        type = "all"
+      ) %>%
+      select(binomial, seq_both, primer_comb, type)
+    
+    # Unique sequences
+    brz_mam_multi_primer_clade_unique[[i]][[j]] <- brz_mam_sequences_unique_class_list[[i]] %>%
+      mutate(
+        seq_both = .data[[primer1]] | .data[[primer2]],
+        primer_comb = toupper(paste0(primer1, " - ", primer2)),
+        type = "unique"
+      ) %>%
+      select(binomial, seq_both, primer_comb, type)
+    
+  }
+}
+
+# 7. Step 7: Combine pairwise lists and calculate % species covered
+
+for (i in 1:length(brz_mam_multi_primer_clade_all)) {
+  
+  # All sequences
+  brz_mam_multi_primer_clade_all[[i]] <- data.table::rbindlist(brz_mam_multi_primer_clade_all[[i]]) %>%
+    group_by(primer_comb) %>%
+    summarize(n_species_all = sum(seq_both), .groups = "drop") %>%
+    mutate(perc_species_all = n_species_all / length(unique(brz_mam_sequences_all_class_list[[i]]$binomial)) * 100)
+  
+  brz_mam_multi_primer_clade_all[[i]] <- transform(
+    brz_mam_multi_primer_clade_all[[i]],
+    primer1 = sapply(strsplit(as.character(primer_comb), " - "), `[`, 1),
+    primer2 = sapply(strsplit(as.character(primer_comb), " - "), `[`, 2)
+  )
+  
+  # Unique sequences
+  brz_mam_multi_primer_clade_unique[[i]] <- data.table::rbindlist(brz_mam_multi_primer_clade_unique[[i]]) %>%
+    group_by(primer_comb) %>%
+    summarize(n_species_unique = sum(seq_both), .groups = "drop") %>%
+    mutate(perc_species_unique = n_species_unique / length(unique(brz_mam_sequences_unique_class_list[[i]]$binomial)) * 100)
+  
+  brz_mam_multi_primer_clade_unique[[i]] <- transform(
+    brz_mam_multi_primer_clade_unique[[i]],
+    primer1 = sapply(strsplit(as.character(primer_comb), " - "), `[`, 1),
+    primer2 = sapply(strsplit(as.character(primer_comb), " - "), `[`, 2)
+  )
+}
+
+# 8. Step 8: Get max individual primer performance for each pair
+
+get_max_performance <- function(primer1, primer2, performance_df, col) {
+  perf1 <- performance_df[performance_df$primer == primer1, col]
+  perf2 <- performance_df[performance_df$primer == primer2, col]
+  return(max(perf1, perf2))
+}
+
+for (i in 1:length(brz_mam_multi_primer_clade_all)) {
+  
+  brz_mam_multi_primer_clade_all[[i]]$max_ind_performance_all <- mapply(
+    get_max_performance, 
+    brz_mam_multi_primer_clade_all[[i]]$primer1,
+    brz_mam_multi_primer_clade_all[[i]]$primer2,
+    MoreArgs = list(performance_df = primer_performance[[i]], col = 2)
+  )
+  
+  brz_mam_multi_primer_clade_unique[[i]]$max_ind_performance_unique <- mapply(
+    get_max_performance,
+    brz_mam_multi_primer_clade_unique[[i]]$primer1,
+    brz_mam_multi_primer_clade_unique[[i]]$primer2,
+    MoreArgs = list(performance_df = primer_performance[[i]], col = 3)
+  )
+}
+
+# 9. Step 9: Combine all and compute primer gain
+
+#    - Primer gain = combined pair performance minus max individual primer performance
+
+brz_mam_multi_primer_clade <- vector("list", length(brz_mam_multi_primer_clade_all))
+
+for (i in 1:length(brz_mam_multi_primer_clade)) {
+  
+  brz_mam_multi_primer_clade[[i]] <- merge(
+    brz_mam_multi_primer_clade_all[[i]][ , !(names(brz_mam_multi_primer_clade_all[[i]]) %in% c("primer1","primer2"))],
+    brz_mam_multi_primer_clade_unique[[i]][ , !(names(brz_mam_multi_primer_clade_unique[[i]]) %in% c("primer1","primer2"))],
+    by = "primer_comb"
+  )
+  
+  # Split primer_comb into primer1 and primer2 as factors
+  brz_mam_multi_primer_clade[[i]]$primer1 <- sapply(strsplit(brz_mam_multi_primer_clade[[i]]$primer_comb, " - "), `[`, 1)
+  brz_mam_multi_primer_clade[[i]]$primer2 <- sapply(strsplit(brz_mam_multi_primer_clade[[i]]$primer_comb, " - "), `[`, 2)
+  
+  brz_mam_multi_primer_clade[[i]]$primer1 <- factor(brz_mam_multi_primer_clade[[i]]$primer1,
+                                                    levels = names(table(brz_mam_multi_primer_clade[[i]]$primer1))[order(table(brz_mam_multi_primer_clade[[i]]$primer1))])
+  brz_mam_multi_primer_clade[[i]]$primer2 <- factor(brz_mam_multi_primer_clade[[i]]$primer2,
+                                                    levels = names(table(brz_mam_multi_primer_clade[[i]]$primer2))[order(table(brz_mam_multi_primer_clade[[i]]$primer2))])
+  
+  # Compute primer gain
+  brz_mam_multi_primer_clade[[i]] <- brz_mam_multi_primer_clade[[i]] %>%
+    mutate(
+      primer_gain_all = perc_species_all - max_ind_performance_all,
+      primer_gain_unique = perc_species_unique - max_ind_performance_unique
+    )
+  
+  brz_mam_multi_primer_clade[[i]]$order <- orders[i]
+}
+
+# Combine all clades into a single data.table
+
+brz_mam_multi_primer_clade <- data.table::rbindlist(brz_mam_multi_primer_clade)
+
+```
+
+**Statistics reported in the main text: complementarity**
+
+Values reported in the Results that cannot be read directly from Figure 2B. Pairs are classed as cross-locus (primers from different mitochondrial regions) or within-locus (same region). The gain is the difference between the completeness of the pair and the completeness of the better of its two primers.
+
+```{r}
+
+# 1. Region of each primer
+
+primer_region <- brz_mam_completeness_all %>%
+  distinct(primer, region) %>%
+  mutate(primer = toupper(primer))
+
+# 2. Pair completeness and gain, with pair type
+
+pair_stats <- as.data.frame(brz_mam_multi_primer_clade) %>%
+  mutate(primer1 = as.character(primer1),
+         primer2 = as.character(primer2)) %>%
+  left_join(rename(primer_region, primer1 = primer, region1 = region), by = "primer1") %>%
+  left_join(rename(primer_region, primer2 = primer, region2 = region), by = "primer2") %>%
+  mutate(pair_type = ifelse(region1 == region2, "within-locus", "cross-locus"))
+
+# 3. Summary across all species, per pair type
+
+pair_summary_all_species <- pair_stats %>%
+  filter(order == "All") %>%
+  group_by(pair_type) %>%
+  summarise(
+    n_pairs                          = n(),
+    median_completeness_all          = median(perc_species_all),
+    q1_completeness_all              = quantile(perc_species_all, 0.25),
+    q3_completeness_all              = quantile(perc_species_all, 0.75),
+    median_gain_all                  = median(primer_gain_all),
+    median_completeness_unambiguous  = median(perc_species_unique),
+    q1_completeness_unambiguous      = quantile(perc_species_unique, 0.25),
+    q3_completeness_unambiguous      = quantile(perc_species_unique, 0.75),
+    median_gain_unambiguous          = median(primer_gain_unique),
+    .groups = "drop"
+  )
+
+pair_summary_all_species
+
+# Table S1: median completeness and gain of cross-locus and within-locus pairs
+
+save_table(
+  pair_summary_all_species %>% mutate(across(where(is.numeric) & !n_pairs, ~ round(.x, 1))),
+  "TableS1_cross_vs_within_locus_pairs",
+  type = "supplementary"
+)
+
+# 4. Best pair across all species, with the gain in species
+
+best_pair_all_species <- pair_stats %>%
+  filter(order == "All") %>%
+  arrange(desc(perc_species_all)) %>%
+  select(primer_comb, pair_type, n_species_all, perc_species_all, primer_gain_all,
+         n_species_unique, perc_species_unique, primer_gain_unique) %>%
+  head(5)
+
+best_pair_all_species
+
+# 5. Best pair per order, and the completeness of the overall best pair in each order
+
+overall_best_pair <- best_pair_all_species$primer_comb[1]
+
+best_pair_by_order <- pair_stats %>%
+  filter(order != "All") %>%
+  group_by(order) %>%
+  summarise(
+    best_pair                    = primer_comb[which.max(perc_species_all)],
+    best_pair_completeness       = max(perc_species_all),
+    overall_best_pair_completeness = perc_species_all[primer_comb == overall_best_pair],
+    difference                   = best_pair_completeness - overall_best_pair_completeness,
+    .groups = "drop"
+  ) %>%
+  arrange(desc(difference))
+
+best_pair_by_order
+
+save_table(best_pair_by_order, "best_primer_pair_by_order", type = "additional")
+
+# 6. Range of single-primer completeness across orders
+
+single_primer_range <- bind_rows(lapply(seq_along(orders), function(i) {
+  data.frame(order = orders[i], primer_performance[[i]])
+})) %>%
+  filter(order != "All")
+
+cat("Single-primer completeness across orders:",
+    round(min(single_primer_range$performance_all), 1), "-",
+    round(max(single_primer_range$performance_all), 1), "%\n")
+
+rm(primer_region, pair_stats, pair_summary_all_species, best_pair_all_species,
+   overall_best_pair, best_pair_by_order, single_primer_range)
+
+```
+
+**Plot the data:**
+
+```{r}
+
+# 1. Step 1: Define Phylopic parameters for each order
+
+#    - mirror: whether to flip the silhouette horizontally
+#    - size_multiplier: scale factor for silhouette size
+
+phylopic_params <- data.frame(
+  order = names(phylopics), 
+  mirror = c(TRUE, FALSE, FALSE, FALSE, FALSE, TRUE, FALSE, TRUE, FALSE, TRUE, TRUE), 
+  size_multiplier = c(1.5, 2, 1.5, 1.5, 2, 2.5, 1.5, 0.8, 2, 1.5, 1.5)
+)
+
+# 2. Step 2: Initialize list to store heatmaps for each order
+
+brz_mam_heatmap <- vector("list")
+
+# 3. Step 3: Loop over each order to create heatmaps
+
+for (i in 1:length(orders)) {
+  
+  # Filter data for the current order
+  data <- brz_mam_multi_primer_clade[brz_mam_multi_primer_clade$order == orders[i], ]
+  
+  # 3A. Step 3a: Define thresholds for dynamic text color based on gain values
+  
+  #    - Text color = black if close to midpoint (within 10% of the range), else white
+  
+  ## For ALL sequences
+  range_all <- max(data$primer_gain_all, na.rm = TRUE) - min(data$primer_gain_all, na.rm = TRUE)
+  midpoint_all <- (max(data$primer_gain_all, na.rm = TRUE) + min(data$primer_gain_all, na.rm = TRUE)) / 2
+  lower_all <- midpoint_all - 0.10 * range_all
+  upper_all <- midpoint_all + 0.10 * range_all
+  
+  data$text_color_all <- ifelse(
+    data$primer_gain_all >= lower_all & data$primer_gain_all <= upper_all,
+    "black", "white"
+  )
+  
+  ## For UNIQUE sequences
+  range_unique <- max(data$primer_gain_unique, na.rm = TRUE) - min(data$primer_gain_unique, na.rm = TRUE)
+  midpoint_unique <- (max(data$primer_gain_unique, na.rm = TRUE) + min(data$primer_gain_unique, na.rm = TRUE)) / 2
+  lower_unique <- midpoint_unique - 0.10 * range_unique
+  upper_unique <- midpoint_unique + 0.10 * range_unique
+  
+  data$text_color_unique <- ifelse(
+    data$primer_gain_unique >= lower_unique & data$primer_gain_unique <= upper_unique,
+    "black", "white"
+  )
+  
+  # 3B. Step 3b: Heatmap for ALL sequences
+  
+  #    - Tile color = primer gain
+  #    - Text = completeness (% species covered)
+  
+  brz_mam_heatmap_all <- ggplot(data, aes(primer1, primer2, fill = primer_gain_all)) +
+    geom_tile() +
+    scale_x_discrete(limits = rev) +
+    scico::scale_fill_scico(
+      palette = "vik",
+      limits = c(min(data$primer_gain_all, na.rm = TRUE), max(data$primer_gain_all, na.rm = TRUE)),
+      name = "Gain over best primer (%)",
+      breaks = seq(
+        floor(min(data$primer_gain_all, na.rm = TRUE)),
+        ceiling(max(data$primer_gain_all, na.rm = TRUE)),
+        by = ceiling((ceiling(max(data$primer_gain_all, na.rm = TRUE)) - floor(min(data$primer_gain_all, na.rm = TRUE))) / 6)
+      ),
+      na.value = "white"
+    ) +
+    geom_text(
+      aes(label = paste0(round(perc_species_all, 1), "%"), color = text_color_all),
+      size = 4.5,
+      fontface = "bold"
+    ) +
+    scale_color_identity() +  # literal color mapping
+    theme_bw() +
+    theme(
+      axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1),
+      axis.text.y = element_text(),
+      axis.title = element_blank(),
+      panel.grid = element_blank(),
+      legend.position = c(0.975, 0.05),
+      legend.justification = c(1, 0),
+      legend.direction = "horizontal",
+      legend.title = element_text(hjust = 0.5, size = 8, face = "bold"),
+      legend.text = element_text(vjust = 0.5),
+      legend.margin = margin(6, 6, 6, 6),
+      legend.background = element_rect(fill = "white", color = NA),
+      plot.margin = margin(t = 20, r = 5, b = 5, l = 5),
+      plot.tag.position = c(0.25, 1.05)
+    ) +
+    guides(fill = guide_colorbar(title.position = "top", title.hjust = 0.5))
+  
+  # Add Phylopic silhouettes if not the "All" category
+  if (i > 1) {
+    brz_mam_heatmap_all <- brz_mam_heatmap_all + 
+      add_phylopic(
+        img = phylopics[[orders[i]]], 
+        x = "KOCHER", 
+        y = "SARRI",  
+        height = phylopic_params[phylopic_params$order == orders[i], ]$size_multiplier, 
+        alpha = 0.8, 
+        horizontal = phylopic_params[phylopic_params$order == orders[i], ]$mirror
+      )
+  }
+  
+  # 3C. Step 3c: Heatmap for UNIQUE sequences (unambiguous)
+  
+  #    - Same style as ALL, but text shows perc_species_unique
+  
+  brz_mam_heatmap_unique <- ggplot(data, aes(primer1, primer2, fill = primer_gain_unique)) +
+    geom_tile() +
+    scale_x_discrete(limits = rev) +
+    scico::scale_fill_scico(
+      palette = "vik",
+      limits = c(min(data$primer_gain_unique, na.rm = TRUE), max(data$primer_gain_unique, na.rm = TRUE)),
+      name = "Gain over best primer (%)",
+      breaks = seq(
+        floor(min(data$primer_gain_unique, na.rm = TRUE)),
+        ceiling(max(data$primer_gain_unique, na.rm = TRUE)),
+        by = ceiling((ceiling(max(data$primer_gain_unique, na.rm = TRUE)) - floor(min(data$primer_gain_unique, na.rm = TRUE))) / 6)
+      ),
+      na.value = "white"
+    ) +
+    geom_text(
+      aes(label = paste0(round(perc_species_unique, 1), "%"), color = text_color_unique),
+      size = 4.5,
+      fontface = "bold"
+    ) +
+    scale_color_identity() +
+    theme_bw() +
+    theme(
+      axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1),
+      axis.text.y = element_blank(),
+      axis.ticks.y = element_blank(),
+      axis.title = element_blank(),
+      panel.grid = element_blank(),
+      legend.position = c(0.975, 0.05),
+      legend.justification = c(1, 0),
+      legend.direction = "horizontal",
+      legend.title = element_text(hjust = 0.5, size = 8, face = "bold"),
+      legend.text = element_text(vjust = 0.5),
+      legend.margin = margin(6, 6, 6, 6),
+      legend.background = element_rect(fill = "white", color = NA),
+      plot.margin = margin(t = 20, r = 5, b = 5, l = 5),
+      plot.tag.position = c(0.05, 1.05)
+    ) +
+    guides(fill = guide_colorbar(title.position = "top", title.hjust = 0.5))
+  
+  # 3D. Step 3d: Combine ALL + UNIQUE heatmaps using patchwork
+  
+  brz_mam_heatmap[[i]] <- (brz_mam_heatmap_all | brz_mam_heatmap_unique) & 
+    theme(plot.tag = element_text(face = 'bold', size = 20))
+}
+
+# 4. Step 4: Example plot display
+
+brz_mam_heatmap[[1]]
+
+
+```
+
+**Save the plots:**
+
+Code to save Figure 2B.
+
+```{r}
+
+save_figure(brz_mam_heatmap[[1]], "Fig2b_primer_complementarity", width = 14, height = 7)
+```
+
+Save the complementarity heatmaps per order (Figs S15-S25).
+
+```{r}
+
+# Supplementary figure numbers, in the order in which the figures appear in
+# the Supplementary Materials
+
+fig_s_number <- c(Rodentia = 15, Primates = 16, Chiroptera = 17, Carnivora = 18,
+                  Artiodactyla = 19, Pilosa = 20, Cingulata = 21, Didelphimorphia = 22,
+                  Lagomorpha = 23, Perissodactyla = 24, Sirenia = 25)
+
+for (i in 2:length(brz_mam_heatmap)) {
+  save_figure(brz_mam_heatmap[[i]],
+              paste0("FigS", fig_s_number[[orders[i]]], "_primer_complementarity_", orders[i]),
+              width = 14, height = 7, type = "supplementary")
+}
+
+rm(fig_s_number)
+
+```
+
+**Clean up the environment:**
+
+```{r}
+
+# Remove objects no longer needed
+
+rm(brz_mam_heatmap)
+rm(brz_mam_heatmap_all)
+rm(brz_mam_heatmap_unique)
+
+rm(brz_mam_multi_primer_clade_all)
+rm(brz_mam_multi_primer_clade_unique)
+
+rm(brz_mam_sequences_all_class_list)
+rm(brz_mam_sequences_class)
+rm(brz_mam_sequences_class_list)
+rm(brz_mam_sequences_unique_class_list)
+
+rm(phylopic_params)
+rm(primer_pairs)
+rm(primer_performance)
+
+
+rm(i)
+rm(j)
+rm(orders)
+rm(primer1)
+rm(primer2)
+rm(get_max_performance)
+
+```
+
+### 1.3.2. ***Ranking of primers and primer pairs across orders***
+
+Weighted rank = primer rank \* (1 + gap in performance between primer / primer-pair and best-performing primer / primer-pair)
+
+**Prepare the data:**
+
+```{r}
+
+# Step 1: Rank individual primers (all sequences)
+
+brz_mam_primer_rank_all <-
+  brz_mam_clade_mean_completeness_all %>%
+    group_by(order) %>%
+    mutate(
+      ranking = rank(desc(cumsum), ties.method = "min")
+    ) %>%
+    arrange(desc(cumsum), .by_group = TRUE) %>%
+    mutate(
+      best              = max(cumsum),
+      diff_from_best    = best - cumsum,
+      diff_fraction     = diff_from_best / best,
+      weighted_ranking  = ranking * (1 + diff_fraction)
+    ) %>%
+    ungroup() %>%
+    group_by(primer) %>%
+    mutate(
+      mean_weighted_ranking = mean(weighted_ranking),
+      sd_weighted_ranking   = sd(weighted_ranking)
+    ) %>%
+    ungroup() %>%
+    select(primer, region, mean_weighted_ranking, sd_weighted_ranking) %>%
+    distinct()
+
+
+# Step 2: Rank individual primers (unambiguous sequences only)
+
+brz_mam_primer_rank_unique <-
+  brz_mam_clade_mean_completeness_unique %>%
+    group_by(order) %>%
+    mutate(
+      ranking = rank(desc(cumsum), ties.method = "min")
+    ) %>%
+    arrange(desc(cumsum), .by_group = TRUE) %>%
+    mutate(
+      best              = max(cumsum),
+      diff_from_best    = best - cumsum,
+      diff_fraction     = diff_from_best / best,
+      weighted_ranking  = ranking * (1 + diff_fraction)
+    ) %>%
+    ungroup() %>%
+    group_by(primer) %>%
+    mutate(
+      mean_weighted_ranking = mean(weighted_ranking),
+      sd_weighted_ranking   = sd(weighted_ranking)
+    ) %>%
+    ungroup() %>%
+    select(primer, region, mean_weighted_ranking, sd_weighted_ranking) %>%
+    distinct()
+
+
+# Step 3: Rank primer pairs (all sequences)
+#   - Excludes pooled "All" order
+
+brz_mam_primer_pair_rank_all <-
+  brz_mam_multi_primer_clade %>%
+    filter(order != "All") %>%
+    group_by(order) %>%
+    mutate(
+      ranking = rank(desc(perc_species_all), ties.method = "min")
+    ) %>%
+    arrange(desc(perc_species_all), .by_group = TRUE) %>%
+    mutate(
+      best              = max(perc_species_all),
+      diff_from_best    = best - perc_species_all,
+      diff_fraction     = diff_from_best / best,
+      weighted_ranking  = ranking * (1 + diff_fraction)
+    ) %>%
+    ungroup() %>%
+    group_by(primer_comb) %>%
+    mutate(
+      mean_weighted_ranking = mean(weighted_ranking),
+      sd_weighted_ranking   = sd(weighted_ranking)
+    ) %>%
+    ungroup() %>%
+    select(primer_comb, mean_weighted_ranking, sd_weighted_ranking) %>%
+    distinct()
+
+
+# Step 4: Rank primer pairs (unambiguous sequences only)
+#   - Excludes pooled "All" order
+
+brz_mam_primer_pair_rank_unique <-
+  brz_mam_multi_primer_clade %>%
+    filter(order != "All") %>%
+    group_by(order) %>%
+    mutate(
+      ranking = rank(desc(perc_species_unique), ties.method = "min")
+    ) %>%
+    arrange(desc(perc_species_unique), .by_group = TRUE) %>%
+    mutate(
+      best              = max(perc_species_unique),
+      diff_from_best    = best - perc_species_unique,
+      diff_fraction     = diff_from_best / best,
+      weighted_ranking  = ranking * (1 + diff_fraction)
+    ) %>%
+    ungroup() %>%
+    group_by(primer_comb) %>%
+    mutate(
+      mean_weighted_ranking = mean(weighted_ranking),
+      sd_weighted_ranking   = sd(weighted_ranking)
+    ) %>%
+    ungroup() %>%
+    select(primer_comb, mean_weighted_ranking, sd_weighted_ranking) %>%
+    distinct()
+```
+
+**Plot the data:**
+
+```{r, fig.width=12, fig.height=6, fig.dpi= 600}
+
+brz_mam_rank_plot_all <- 
+  
+  ggplot(brz_mam_primer_rank_all, aes(mean_weighted_ranking, 
+                                sd_weighted_ranking, 
+                                label = primer))+
+  
+  geom_vline(xintercept = mean(brz_mam_primer_rank_all$mean_weighted_ranking), 
+             linewidth = 0.5, 
+             color = "grey80", 
+             linetype = "dashed")+
+  
+  geom_hline(yintercept = mean(brz_mam_primer_rank_all$sd_weighted_ranking), 
+             linewidth = 0.5, 
+             color = "grey80", 
+             linetype = "dashed") + 
+  
+  geom_point(size = 5, 
+             alpha = 0.5, 
+             shape = 21, 
+             stroke = 1, 
+             fill = case_when(
+             brz_mam_primer_rank_all$region == "12S" ~ "#68a898",
+             brz_mam_primer_rank_all$region == "16S" ~ "#b62c25",
+             brz_mam_primer_rank_all$region == "COI" ~ "#f6b332",
+             brz_mam_primer_rank_all$region == "Cytb" ~ "#2965a2"), 
+           color = case_when(
+             brz_mam_primer_rank_all$region == "12S" ~ "#68a898",
+             brz_mam_primer_rank_all$region == "16S" ~ "#b62c25",
+             brz_mam_primer_rank_all$region == "COI" ~ "#f6b332",
+             brz_mam_primer_rank_all$region == "Cytb" ~ "#2965a2")) + 
+  
+  scale_x_continuous(expand = c(0.2, 0.2)) +
+  
+  scale_y_continuous(expand = c(0.2, 0.2))+
+  
+  ggrepel::geom_text_repel(box.padding = 0.8, 
+                           size = 6, 
+                           max.overlaps = 20)+
+  
+  theme_bw(base_size = 12) +
+  theme(legend.position = "none",
+        panel.grid = element_blank(),
+        plot.title.position = "plot",
+        plot.title = element_text(hjust = .6, face = "bold", size = 20),
+        plot.subtitle = element_text(size = 10, hjust = .5),
+        plot.caption = element_text(size = 8), 
+        axis.text.y = element_text(size = 18),
+        axis.text.x = element_text(size = 18), 
+        axis.title.x = element_text(size = 20, 
+                                    margin = margin(t = 10)), 
+        axis.title.y = element_text(size = 20, 
+                                    margin = margin(r = 10))) + 
+  
+  xlab("Mean weighted rank") +
+  ylab("SD weighted rank") + 
+  
+  ggtitle("All sequences")
+
+brz_mam_rank_plot_unique <- 
+  
+  ggplot(brz_mam_primer_rank_unique, aes(mean_weighted_ranking, 
+                                sd_weighted_ranking, 
+                                label = primer))+
+  
+  geom_vline(xintercept = mean(brz_mam_primer_rank_unique$mean_weighted_ranking), 
+             linewidth = 0.5, 
+             color = "grey80", 
+             linetype = "dashed")+
+  
+  geom_hline(yintercept = mean(brz_mam_primer_rank_unique$sd_weighted_ranking), 
+             linewidth = 0.5, 
+             color = "grey80", 
+             linetype = "dashed") + 
+  
+  geom_point(size = 5, 
+             alpha = 0.5, 
+             shape = 21, 
+             stroke = 1, 
+             fill = case_when(
+             brz_mam_primer_rank_unique$region == "12S" ~ "#68a898",
+             brz_mam_primer_rank_unique$region == "16S" ~ "#b62c25",
+             brz_mam_primer_rank_unique$region == "COI" ~ "#f6b332",
+             brz_mam_primer_rank_unique$region == "Cytb" ~ "#2965a2"), 
+           color = case_when(
+             brz_mam_primer_rank_unique$region == "12S" ~ "#68a898",
+             brz_mam_primer_rank_unique$region == "16S" ~ "#b62c25",
+             brz_mam_primer_rank_unique$region == "COI" ~ "#f6b332",
+             brz_mam_primer_rank_unique$region == "Cytb" ~ "#2965a2")) +
+  
+  scale_x_continuous(expand = c(0.2, 0.2)) +
+  
+  scale_y_continuous(expand = c(0.2, 0.2))+
+  
+  ggrepel::geom_text_repel(box.padding = 0.8, 
+                           size = 6, 
+                           max.overlaps = 20)+
+  
+  theme_bw(base_size = 12) +
+  theme(legend.position = "none",
+        panel.grid = element_blank(),
+        plot.title.position = "plot",
+        plot.title = element_text(hjust = .6, face = "bold", size = 20),
+        plot.subtitle = element_text(size = 10, hjust = .5),
+        plot.caption = element_text(size = 8), 
+        axis.text.y = element_text(size = 18),
+        axis.text.x = element_text(size = 18), 
+        axis.title.x = element_text(size = 20, 
+                                    margin = margin(t = 10)), 
+        axis.title.y = element_text(size = 20, 
+                                    margin = margin(r = 10))) + 
+  
+  xlab("Mean weighted rank") +
+  ylab("SD weighted rank") + 
+  
+  ggtitle("Unambiguous sequences")
+
+
+brz_mam_rank_plot_all_pairs <- 
+  
+  ggplot(brz_mam_primer_pair_rank_all, aes(mean_weighted_ranking, 
+                                sd_weighted_ranking, 
+                                label = primer_comb))+
+  
+  geom_vline(xintercept = mean(brz_mam_primer_pair_rank_all$mean_weighted_ranking), 
+             linewidth = 0.5, 
+             color = "grey80", 
+             linetype = "dashed")+
+  
+  geom_hline(yintercept = mean(brz_mam_primer_pair_rank_all$sd_weighted_ranking), 
+             linewidth = 0.5, 
+             color = "grey80",
+             linetype = "dashed") + 
+  
+  geom_point(data = brz_mam_primer_pair_rank_all[order(brz_mam_primer_pair_rank_all$mean_weighted_ranking),][-c(1:5), ], 
+             aes(mean_weighted_ranking, 
+                                sd_weighted_ranking),
+             size = 1, 
+             alpha = 0.5, 
+             shape = 21, 
+             stroke = 1, 
+             color = "grey80",
+             fill = "grey80",
+             inherit.aes = FALSE) + 
+  
+  geom_point(data = head(brz_mam_primer_pair_rank_all[order(brz_mam_primer_pair_rank_all$mean_weighted_ranking),], 5), 
+             aes(mean_weighted_ranking, 
+                                sd_weighted_ranking),
+             size = 1, 
+             alpha = 0.5, 
+             shape = 21, 
+             stroke = 1, 
+             color = "grey20", 
+             fill = "grey20",
+             inherit.aes = FALSE) + 
+  
+  scale_x_continuous(expand = c(0.2, 0.2)) +
+  
+  scale_y_continuous(expand = c(0.2, 0.2))+
+  
+  ggrepel::geom_text_repel(data = head(brz_mam_primer_pair_rank_all[order(brz_mam_primer_pair_rank_all$mean_weighted_ranking),], 5),
+                           
+                           aes(mean_weighted_ranking, 
+                                sd_weighted_ranking, 
+                                label = tolower(primer_comb)),
+                           
+                           inherit.aes = FALSE,
+                           
+                           box.padding = 0.8, 
+                           size = 6, 
+                           max.overlaps = 20)+
+  
+  theme_bw(base_size = 12) +
+  theme(legend.position = "none",
+        panel.grid = element_blank(),
+        plot.title.position = "plot",
+        plot.title = element_text(hjust = .6, face = "bold", size = 20),
+        plot.subtitle = element_text(size = 10, hjust = .5),
+        plot.caption = element_text(size = 8), 
+        axis.text.y = element_text(size = 18),
+        axis.text.x = element_text(size = 18), 
+        axis.title.x = element_text(size = 20, 
+                                    margin = margin(t = 10)), 
+        axis.title.y = element_text(size = 20, 
+                                    margin = margin(r = 10))) + 
+  
+  xlab("Mean weighted rank") +
+  ylab("SD weighted rank") + 
+  
+  ggtitle("All sequences")
+
+brz_mam_rank_plot_unique_pairs <- 
+  
+  ggplot(brz_mam_primer_pair_rank_unique, aes(mean_weighted_ranking, 
+                                sd_weighted_ranking, 
+                                label = primer_comb))+
+  
+  geom_vline(xintercept = mean(brz_mam_primer_pair_rank_unique$mean_weighted_ranking), 
+             linewidth = 0.5, 
+             color = "grey80", 
+             linetype = "dashed")+
+  
+  geom_hline(yintercept = mean(brz_mam_primer_pair_rank_unique$sd_weighted_ranking), 
+             linewidth = 0.5, 
+             color = "grey80", 
+             linetype = "dashed") + 
+  
+  geom_point(data = brz_mam_primer_pair_rank_unique[order(brz_mam_primer_pair_rank_unique$mean_weighted_ranking),][-c(1:5), ], 
+             aes(mean_weighted_ranking, 
+                                sd_weighted_ranking),
+             size = 1, 
+             alpha = 0.5, 
+             shape = 21, 
+             stroke = 1, 
+             color = "grey80", 
+             fill = "grey80",
+             inherit.aes = FALSE) + 
+  
+  geom_point(data = head(brz_mam_primer_pair_rank_unique[order(brz_mam_primer_pair_rank_unique$mean_weighted_ranking),], 5), 
+             aes(mean_weighted_ranking, 
+                                sd_weighted_ranking),
+              size = 1, 
+             alpha = 0.5, 
+             shape = 21, 
+             stroke = 1, 
+             color = "grey20", 
+             fill = "grey20",
+             inherit.aes = FALSE) + 
+  
+  scale_x_continuous(expand = c(0.2, 0.2)) +
+  
+  scale_y_continuous(expand = c(0.2, 0.2))+
+  
+  ggrepel::geom_text_repel(data = head(brz_mam_primer_pair_rank_unique[order(brz_mam_primer_pair_rank_unique$mean_weighted_ranking),], 5),
+                           
+                           aes(mean_weighted_ranking, 
+                                sd_weighted_ranking, 
+                                label = tolower(primer_comb)),
+                           
+                           inherit.aes = FALSE,
+                           
+                           box.padding = 0.8, 
+                           size = 6, 
+                           max.overlaps = 20)+
+  
+  theme_bw(base_size = 12) +
+  theme(legend.position = "none",
+        panel.grid = element_blank(),
+        plot.title.position = "plot",
+        plot.title = element_text(hjust = .6, face = "bold", size = 20),
+        plot.subtitle = element_text(size = 10, hjust = .5),
+        plot.caption = element_text(size = 8), 
+        axis.text.y = element_text(size = 18),
+        axis.text.x = element_text(size = 18), 
+        axis.title.x = element_text(size = 20, 
+                                    margin = margin(t = 10)), 
+        axis.title.y = element_text(size = 20, 
+                                    margin = margin(r = 10))) + 
+  
+  xlab("Mean weighted rank") +
+  ylab("SD weighted rank") + 
+  
+  ggtitle("Unambiguous sequences")
+
+figure_2c <- (brz_mam_rank_plot_all | brz_mam_rank_plot_unique)
+figure_2d <- (brz_mam_rank_plot_all_pairs | brz_mam_rank_plot_unique_pairs)
+
+figure_2c
+figure_2d
+
+```
+
+**Save the plot:**
+
+```{r}
+
+save_figure(figure_2c, "Fig2c_primer_rank", width = 14, height = 7)
+save_figure(figure_2d, "Fig2d_primer_pair_rank", width = 14, height = 7)
+
+```
+
+**Clean up environment:**
+
+```{r}
+# Remove objects no longer needed
+
+rm(brz_mam_rank_plot_all)
+rm(brz_mam_rank_plot_unique)
+rm(brz_mam_clade_primer_completeness_all)
+rm(brz_mam_clade_primer_completeness_unique)
+rm(figure_2c)
+rm(figure_2d)
+rm(lower_all)
+rm(lower_unique)
+rm(midpoint_all)
+rm(midpoint_unique)
+rm(range_all)
+rm(range_unique)
+rm(upper_all)
+rm(upper_unique)
+rm(min_mean_max_per_clade_all)
+rm(min_mean_max_per_clade_unique)
+rm(data)
+rm(brz_mam_rank_plot_all_pairs)
+rm(brz_mam_rank_plot_unique_pairs)
+rm(brz_mam_primer_rank_all)
+rm(brz_mam_primer_rank_unique)
+rm(brz_mam_primer_pair_rank_all)
+rm(brz_mam_primer_pair_rank_unique)
+rm(brz_mam_multi_primer_clade)
+
+```
+
+# 2. Save outputs for the next steps
+
+```{r}
+
+save_step("2_Assess_completeness_ambiguity_complementarity", c(
+  "brz_mam_completeness_all",
+  "brz_mam_completeness_unique"
+))
+
+```
+
+This completes the assessment of database completeness, ambiguity and complementarity. The next step is `3_Drivers_of_database_omission.Rmd`.
+
+```{r}
+
+sessionInfo()
+
+```

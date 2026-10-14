@@ -1,0 +1,19 @@
+{
+"type": "FeatureCollection",
+"name": "cities",
+"xy_coordinate_resolution": 0.0001,
+"features": [
+{ "type": "Feature", "properties": { "name": "Belo Horizonte" }, "geometry": { "type": "Point", "coordinates": [ -43.917, -19.9131 ] } },
+{ "type": "Feature", "properties": { "name": "Manaus" }, "geometry": { "type": "Point", "coordinates": [ -60.002, -3.0981 ] } },
+{ "type": "Feature", "properties": { "name": "Belém" }, "geometry": { "type": "Point", "coordinates": [ -48.482, -1.4481 ] } },
+{ "type": "Feature", "properties": { "name": "Brasília" }, "geometry": { "type": "Point", "coordinates": [ -47.918, -15.7814 ] } },
+{ "type": "Feature", "properties": { "name": "Porto Alegre" }, "geometry": { "type": "Point", "coordinates": [ -51.202, -30.0481 ] } },
+{ "type": "Feature", "properties": { "name": "Curitiba" }, "geometry": { "type": "Point", "coordinates": [ -49.3219, -25.4181 ] } },
+{ "type": "Feature", "properties": { "name": "Fortaleza" }, "geometry": { "type": "Point", "coordinates": [ -38.5819, -3.7481 ] } },
+{ "type": "Feature", "properties": { "name": "Salvador" }, "geometry": { "type": "Point", "coordinates": [ -38.4819, -12.968 ] } },
+{ "type": "Feature", "properties": { "name": "Goiânia" }, "geometry": { "type": "Point", "coordinates": [ -49.302, -16.7181 ] } },
+{ "type": "Feature", "properties": { "name": "Recife" }, "geometry": { "type": "Point", "coordinates": [ -34.9088, -8.0605 ] } },
+{ "type": "Feature", "properties": { "name": "Rio de Janeiro" }, "geometry": { "type": "Point", "coordinates": [ -43.2121, -22.9073 ] } },
+{ "type": "Feature", "properties": { "name": "São Paulo" }, "geometry": { "type": "Point", "coordinates": [ -46.627, -23.5567 ] } }
+]
+}

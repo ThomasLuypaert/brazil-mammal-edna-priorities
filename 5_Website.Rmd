@@ -1,0 +1,481 @@
+---
+title: "Part 5: Data for the interactive website"
+author: "Thomas Luypaert"
+date: "2026-10-14"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+source(here::here("R", "io.R"))
+```
+
+# Welcome
+
+This is an optional step after the analysis for the paper *"Knowledge Gaps and Sequencing Priorities for Mammalian eDNA Metabarcoding in the World's Largest Tropical Forest Country"*. It does not change any result in the paper.
+
+It writes the data for the interactive website in `docs/` (served with GitHub Pages): the priority list of all 731 species, the species in each 25 × 25 km grid cell, the map outlines, and the reference sequences of Brazilian mammals per primer. The website itself (`docs/index.html` and `docs/assets/`) is static and does not need to be rebuilt; this document only replaces the files in `docs/data/`.
+
+**Inputs:** `output/intermediate/1_Prepare_data.rds` (Part 1), `output/intermediate/2_Assess_completeness_ambiguity_complementarity.rds` (Part 2), `output/intermediate/4_Barcoding_priorities.rds` (Part 4), and the cached range polygons and biome borders from Part 4.
+
+**Output:** `docs/data/`.
+
+# 0. Priors
+
+**Load R packages:**
+
+```{r}
+
+library(here)
+library(sf)
+library(rnaturalearth)
+library(jsonlite)
+library(httr)
+library(rgbif)
+library(rmdd)
+
+# Loaded last so that these functions are not masked
+library(purrr)
+library(tidyr)
+library(dplyr)
+library(stringr)
+
+```
+
+**Load data from Parts 1, 2 and 4:**
+
+```{r}
+
+load_step("1_Prepare_data", c(
+  "brz_mam_eDNA",
+  "brz_mam_synonyms",
+  "brz_mam_taxonomy",
+  "species_without_range_map"
+))
+
+load_step("2_Assess_completeness_ambiguity_complementarity", c(
+  "brz_mam_completeness_all"
+))
+
+load_step("4_Barcoding_priorities", c(
+  "EDGE2_species",
+  "priority_species_flags"
+))
+
+```
+
+**Settings:**
+
+```{r}
+
+site_version <- "1.0.0"
+zenodo_doi   <- "10.5281/zenodo.23365811"
+repository   <- "https://github.com/ThomasLuypaert/brazil-mammal-edna-priorities"
+
+data_dir <- here("docs", "data")
+dir.create(file.path(data_dir, "sequences"), recursive = TRUE, showWarnings = FALSE)
+
+rebuild_cache <- FALSE
+
+needs_build <- function(name) {
+  rebuild_cache || !file.exists(cache_file(name))
+}
+
+# Writes compact JSON (scalars are unboxed explicitly)
+write_json_compact <- function(x, file) {
+  writeLines(jsonlite::toJSON(x, auto_unbox = FALSE, null = "null", na = "null", digits = NA),
+             file, useBytes = TRUE)
+}
+
+```
+
+# 1. Species table
+
+**Common names:**
+
+Common names from the Mammal Diversity Database (`rmdd`), matched on accepted names and then synonyms, for all species. The manual names are the same as in Part 4.
+
+```{r}
+
+mdd_key  <- function(x) tolower(gsub("[_ ]+", " ", trimws(x)))
+mdd      <- rmdd::mdd_checklist
+accepted <- setNames(mdd$main_common_name, mdd_key(mdd$sci_name))
+
+syn <- unique(data.frame(
+  key      = mdd_key(rmdd::mdd_synonyms$mdd_original_combination),
+  accepted = mdd_key(rmdd::mdd_synonyms$mdd_species)
+))
+syn <- syn[!is.na(syn$key) & syn$accepted %in% names(accepted), ]
+syn <- syn[!syn$key %in% syn$key[duplicated(syn$key)], ]
+synonym_names <- setNames(accepted[syn$accepted], syn$key)
+
+keys <- mdd_key(brz_mam_taxonomy$binomial)
+common_names <- unname(accepted[keys])
+via_synonym <- is.na(common_names) & keys %in% names(synonym_names)
+common_names[via_synonym] <- unname(synonym_names[keys[via_synonym]])
+names(common_names) <- brz_mam_taxonomy$binomial
+
+common_name_overrides <- c(
+  "Aotus infulatus"          = "Feline Night Monkey",
+  "Pithecia inusta"          = "Burnished Saki",
+  "Alouatta puruensis"       = "Purus Red Howler",
+  "Metachirus arinatai"      = "Aritana's Brown Four-eyed Opossum",
+  "Rhipidomys cearanus"      = "Ceará Climbing Mouse",
+  "Rhipidomys baturiteensis" = "Baturité Climbing Mouse",
+  "Sylvilagus minensis"      = "Minas Gerais Tapeti",
+  "Sylvilagus paraguensis"   = "Paraguayan Tapeti",
+  "Makalata obscura"         = "Dusky Spiny Tree-rat"
+)
+common_names[names(common_name_overrides)] <- common_name_overrides
+
+message(sum(is.na(common_names)), " species without a common name")
+
+rm(mdd_key, mdd, accepted, syn, synonym_names, keys, via_synonym, common_name_overrides)
+
+```
+
+**Links to Wikipedia and GBIF:**
+
+English Wikipedia pages are found through Wikidata (taxon name, property P225), and GBIF species pages through the GBIF backbone taxonomy. Both are online queries, so the results are cached. Species without a Wikipedia page get no link.
+
+```{r}
+
+if (needs_build("website_links.rds")) {
+
+  # 1. Wikipedia: query Wikidata in batches of 100 names
+
+  query_wikipedia <- function(names) {
+    values <- paste0('"', names, '"', collapse = " ")
+    query <- paste0(
+      'SELECT ?name ?article WHERE { VALUES ?name { ', values, ' } ',
+      '?item wdt:P225 ?name . ',
+      '?article schema:about ?item ; schema:isPartOf <https://en.wikipedia.org/> . }'
+    )
+    res <- httr::GET("https://query.wikidata.org/sparql",
+                     query = list(query = query, format = "json"),
+                     httr::user_agent("Brazilian mammal sequencing priorities (research website)"),
+                     httr::timeout(60))
+    httr::stop_for_status(res)
+    rows <- jsonlite::fromJSON(httr::content(res, as = "text", encoding = "UTF-8"))$results$bindings
+    if (length(rows) == 0) return(data.frame(binomial = character(), wikipedia = character()))
+    data.frame(binomial = rows$name$value, wikipedia = rows$article$value)
+  }
+
+  batches <- split(brz_mam_taxonomy$binomial, ceiling(seq_along(brz_mam_taxonomy$binomial) / 100))
+  wikipedia <- bind_rows(lapply(batches, function(b) { Sys.sleep(1); query_wikipedia(b) })) %>%
+    distinct(binomial, .keep_all = TRUE)
+
+  # 2. GBIF: backbone key of each species (exact or fuzzy species-level matches only)
+
+  gbif <- rgbif::name_backbone_checklist(brz_mam_taxonomy$binomial) %>%
+    transmute(binomial = verbatim_name,
+              gbif_key = ifelse(matchType %in% c("EXACT", "FUZZY") & rank == "SPECIES", usageKey, NA))
+
+  links <- brz_mam_taxonomy %>%
+    select(binomial) %>%
+    left_join(wikipedia, by = "binomial") %>%
+    left_join(gbif, by = "binomial")
+
+  saveRDS(links, cache_file("website_links.rds"))
+
+  rm(query_wikipedia, batches, wikipedia, gbif, links)
+}
+
+links <- readRDS(cache_file("website_links.rds"))
+
+message(sum(!is.na(links$wikipedia)), " species with a Wikipedia page, ",
+        sum(!is.na(links$gbif_key)), " with a GBIF key")
+
+```
+
+**Build the species table:**
+
+Species are numbered in alphabetical order; the numbers link the species table to the grid cells and the sequences.
+
+```{r}
+
+primers_with_sequence <- brz_mam_completeness_all %>%
+  group_by(binomial) %>%
+  summarise(n_primers = sum(presence > 0), .groups = "drop")
+
+site_species <- brz_mam_taxonomy %>%
+  select(binomial, order, family) %>%
+  arrange(binomial) %>%
+  mutate(id = seq_len(n()) - 1L) %>%
+  left_join(priority_species_flags %>% select(binomial, global_category, local_category), by = "binomial") %>%
+  left_join(EDGE2_species %>% select(binomial, iucn_status, salve_status,
+                                     median_BREDGE_global, median_BREDGE_brz,
+                                     median_ED_global, median_ED_brz,
+                                     median_pext_global, median_pext_brz,
+                                     median_exclusion_prob_global), by = "binomial") %>%
+  left_join(primers_with_sequence, by = "binomial") %>%
+  left_join(links, by = "binomial") %>%
+  mutate(across(c(global_category, local_category), ~ replace_na(.x, "None")),
+         n_primers = replace_na(n_primers, 0L),
+         common_name = unname(common_names[binomial]),
+         has_range_map = !binomial %in% species_without_range_map)
+
+stopifnot(nrow(site_species) == nrow(brz_mam_taxonomy), !any(duplicated(site_species$binomial)))
+
+species_id <- setNames(site_species$id, site_species$binomial)
+
+# Short field names keep the file small; see docs/assets/js/site.js
+species_json <- lapply(seq_len(nrow(site_species)), function(i) {
+  s <- site_species[i, ]
+  list(
+    id = unbox(s$id), b = unbox(s$binomial), c = unbox(coalesce(s$common_name, "")),
+    o = unbox(s$order), f = unbox(s$family),
+    gc = unbox(s$global_category), lc = unbox(s$local_category),
+    iu = unbox(s$iucn_status), sa = unbox(s$salve_status),
+    bg = unbox(round(s$median_BREDGE_global, 3)), bl = unbox(round(s$median_BREDGE_brz, 3)),
+    eg = unbox(round(s$median_ED_global, 2)), el = unbox(round(s$median_ED_brz, 2)),
+    ge = unbox(round(s$median_pext_global, 3)), le = unbox(round(s$median_pext_brz, 3)),
+    po = unbox(round(s$median_exclusion_prob_global, 3)),
+    np = unbox(s$n_primers),
+    w = unbox(if (is.na(s$wikipedia)) NA else s$wikipedia),
+    gb = unbox(if (is.na(s$gbif_key)) NA else as.integer(s$gbif_key)),
+    rm = unbox(s$has_range_map)
+  )
+})
+
+write_json_compact(list(species = species_json), file.path(data_dir, "species.json"))
+
+rm(primers_with_sequence, species_json, common_names, links)
+
+```
+
+# 2. Map data
+
+**Grid cells and the priority species in each cell:**
+
+The grid is built exactly as in Part 4 (25 × 25 km cells in EPSG:3857, anchored at the lower-left corner of Brazil's bounding box), so that the website can find the cell of any clicked point from its coordinates.
+
+```{r}
+
+brazil      <- ne_countries(country = "Brazil", scale = "medium", returnclass = "sf") %>% st_transform(4326)
+brazil_proj <- st_transform(brazil, 3857)
+
+resolution_m <- 25000
+origin <- st_bbox(brazil_proj)
+
+grid_sf_proj <- st_sf(geometry = st_make_grid(brazil_proj, cellsize = resolution_m, square = TRUE))
+grid_sf_proj <- grid_sf_proj[st_intersects(grid_sf_proj, brazil_proj, sparse = FALSE), ]
+
+range_polygons <- readRDS(cache_file("brazilian_range_polygons.rds"))
+intersections  <- st_intersects(grid_sf_proj, range_polygons, sparse = TRUE)
+
+# Column and row of each cell, counted from the grid origin
+centres <- st_coordinates(st_centroid(st_geometry(grid_sf_proj)))
+cell_col <- floor((centres[, 1] - origin[["xmin"]]) / resolution_m)
+cell_row <- floor((centres[, 2] - origin[["ymin"]]) / resolution_m)
+
+# Priority species (either perspective) in each cell, as species numbers
+priority_ids <- species_id[site_species$binomial[site_species$global_category != "None" |
+                                                 site_species$local_category  != "None"]]
+
+cells <- lapply(intersections, function(i) {
+  ids <- unname(species_id[unique(range_polygons$binomial[i])])
+  sort(as.integer(intersect(ids, priority_ids)))
+})
+names(cells) <- paste0(cell_col, "_", cell_row)
+
+stopifnot(!any(duplicated(names(cells))))
+
+write_json_compact(
+  list(crs  = unbox("EPSG:3857"),
+       xmin = unbox(origin[["xmin"]]), ymin = unbox(origin[["ymin"]]),
+       res  = unbox(resolution_m),
+       ncol = unbox(as.integer(max(cell_col) + 1)), nrow = unbox(as.integer(max(cell_row) + 1)),
+       cells = cells),
+  file.path(data_dir, "grid.json")
+)
+
+message(length(cells), " grid cells; ", sum(lengths(cells) > 0), " with at least one priority species")
+
+```
+
+**All species in each cell:**
+
+For the location filter of the sequence downloads, the website needs every species whose range overlaps a cell, not only the priority species. To keep the file small, each cell's species are stored as a bit set (one bit per species number, base64-encoded), and cells with the same species share one bit set.
+
+```{r}
+
+n_bits <- 8 * ceiling(nrow(site_species) / 8)
+
+cell_sets <- vapply(intersections, function(i) {
+  ids  <- unname(species_id[unique(range_polygons$binomial[i])])
+  bits <- logical(n_bits)
+  bits[ids[!is.na(ids)] + 1] <- TRUE
+  jsonlite::base64_enc(packBits(bits, type = "raw"))   # bit k of byte j = species 8j + k
+}, character(1))
+
+unique_sets <- unique(cell_sets)
+cell_index  <- setNames(as.list(match(cell_sets, unique_sets) - 1L), names(cells))
+
+write_json_compact(
+  list(n_species = unbox(nrow(site_species)),
+       sets      = unique_sets,
+       cells     = lapply(cell_index, unbox)),
+  file.path(data_dir, "grid_all.json")
+)
+
+message(length(unique_sets), " distinct species sets across ", length(cell_sets), " cells")
+
+rm(grid_sf_proj, range_polygons, intersections, centres, cell_col, cell_row, priority_ids, cells, origin,
+   n_bits, cell_sets, unique_sets, cell_index)
+
+```
+
+**Outlines of Brazil and its biomes, major rivers and reference cities:**
+
+Simplified for the web, with coordinates rounded to about 10 m.
+
+```{r}
+
+write_geojson <- function(x, file) {
+  if (file.exists(file)) file.remove(file)
+  st_write(x, file, driver = "GeoJSON", quiet = TRUE,
+           layer_options = c("COORDINATE_PRECISION=4", "RFC7946=YES"))
+}
+
+brazil_simple <- brazil %>%
+  st_transform(5880) %>%
+  st_simplify(dTolerance = 1000) %>%
+  st_transform(4326) %>%
+  transmute(name = "Brazil")
+
+write_geojson(brazil_simple, file.path(data_dir, "brazil.geojson"))
+
+biome_names <- c("Amazonia" = "Amazon", "Mata Atlantica" = "Atlantic Forest", "Caatinga" = "Caatinga",
+                 "Cerrado" = "Cerrado", "Pampa" = "Pampa", "Pantanal" = "Pantanal")
+
+biomes_simple <- readRDS(cache_file("biomes.rds")) %>%
+  mutate(name_ascii = iconv(name_biome, to = "ASCII//TRANSLIT")) %>%
+  filter(name_ascii %in% names(biome_names)) %>%
+  transmute(biome = unname(biome_names[name_ascii])) %>%
+  st_make_valid() %>%
+  st_transform(5880) %>%
+  st_simplify(preserveTopology = TRUE, dTolerance = 2000) %>%
+  st_transform(4326)
+
+write_geojson(biomes_simple, file.path(data_dir, "biomes.geojson"))
+
+# Major rivers and reference cities, as in Fig. 5 (cached in Part 4)
+ne_layers <- readRDS(cache_file("natural_earth_layers.rds"))
+
+rivers_simple <- ne_layers$major_rivers %>%
+  select(any_of("name")) %>%
+  st_transform(5880) %>%
+  st_simplify(dTolerance = 1000) %>%
+  st_transform(4326)
+
+write_geojson(rivers_simple, file.path(data_dir, "rivers.geojson"))
+
+cities_points <- ne_layers$cities_brazil %>%
+  transmute(name = NAME) %>%
+  st_transform(4326)
+
+write_geojson(cities_points, file.path(data_dir, "cities.geojson"))
+
+rm(write_geojson, brazil, brazil_proj, brazil_simple, biome_names, biomes_simple, resolution_m,
+   ne_layers, rivers_simple, cities_points)
+
+```
+
+# 3. Reference sequences
+
+For each primer, the reference sequences of Brazilian species (matched through the synonym list, as in Part 2), with their GenBank accession and whether the sequence is shared with another Brazilian species (ambiguous).
+
+```{r}
+
+# Name (accepted name or synonym) -> accepted name; synonyms shared by several
+# species are left out, as in Part 2
+syn_table <- stack(brz_mam_synonyms)
+syn_table <- syn_table[!syn_table$values %in% syn_table$values[duplicated(syn_table$values)], ]
+to_accepted <- setNames(as.character(syn_table$ind), syn_table$values)
+
+sequence_summary <- list()
+
+for (primer in names(brz_mam_eDNA)) {
+
+  db <- brz_mam_eDNA[[primer]]
+
+  seqs <- tibble(
+    accession = str_extract(map_chr(db, ~ attr(.x, "name")), "^[^;]+"),
+    name      = names(db),
+    sequence  = toupper(map_chr(db, ~ .x[1]))
+  ) %>%
+    mutate(binomial = unname(to_accepted[name])) %>%
+    filter(!is.na(binomial)) %>%
+    distinct(accession, binomial, sequence) %>%
+    group_by(sequence) %>%
+    mutate(ambiguous = as.integer(n_distinct(binomial) > 1)) %>%
+    ungroup() %>%
+    arrange(binomial, accession)
+
+  rows <- lapply(seq_len(nrow(seqs)), function(i) {
+    list(seqs$accession[i], unname(species_id[[seqs$binomial[i]]]), seqs$sequence[i], seqs$ambiguous[i])
+  })
+
+  writeLines(
+    jsonlite::toJSON(list(primer = unbox(primer), rows = rows), auto_unbox = TRUE),
+    file.path(data_dir, "sequences", paste0(primer, ".json")),
+    useBytes = TRUE
+  )
+
+  sequence_summary[[primer]] <- data.frame(primer = primer, n_sequences = nrow(seqs),
+                                           n_species = n_distinct(seqs$binomial))
+}
+
+bind_rows(sequence_summary)
+
+rm(syn_table, to_accepted, primer, db, seqs, rows, sequence_summary)
+
+```
+
+# 4. Site information
+
+```{r}
+
+primer_info <- data.frame(
+  id       = c("12S_ushio", "12S_riaz", "12S_taberlet", "16S_kitano", "16S_sarri",
+               "16S_tabgig", "16S_taylor", "COI_kocher", "COI_leray", "Cytb_steuber"),
+  name     = c("Ushio", "Riaz", "Taberlet", "Kitano", "Sarri",
+               "Tabgig", "Taylor", "Kocher", "Leray", "Steuber"),
+  locus    = c("12S", "12S", "12S", "16S", "16S", "16S", "16S", "COI", "COI", "CytB"),
+  original = c("MiMammal-U", "12S-V5", "Mamm01", "L2513/H2714", "",
+               "Mamm02", "16Smam1/16Smam2", "COI_minimam", "mlCOIintF/jgHCO2198", "cyt b1/cyt b2")
+)
+
+stopifnot(setequal(primer_info$id, names(brz_mam_eDNA)))
+
+write_json_compact(
+  list(version    = unbox(site_version),
+       generated  = unbox(format(Sys.Date())),
+       doi        = unbox(zenodo_doi),
+       repository = unbox(repository),
+       n_species  = unbox(nrow(site_species)),
+       primers    = primer_info),
+  file.path(data_dir, "meta.json")
+)
+
+# GitHub Pages: serve the files as they are (no Jekyll processing)
+file.create(here("docs", ".nojekyll"))
+
+# Size of the data files
+files <- list.files(data_dir, recursive = TRUE, full.names = TRUE)
+data.frame(file = sub(paste0(data_dir, "/"), "", files),
+           size_MB = round(file.size(files) / 1e6, 2))
+
+rm(primer_info, files)
+
+```
+
+To view the site locally, run `servr::httd("docs")` (or any local web server) and open the address it prints; opening `docs/index.html` directly from disk does not work, because browsers block loading the data files from `file://` addresses.
+
+```{r}
+
+sessionInfo()
+
+```

@@ -1,0 +1,1992 @@
+---
+title: "Part 4: Barcoding priorities"
+author: "Thomas Luypaert"
+date: "2026-09-30"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+source(here::here("R", "io.R"))
+source(here::here("R", "figures.R"))
+```
+
+# Welcome
+
+This is Part 4 of the analysis for the paper *"Knowledge Gaps and Sequencing Priorities for Mammalian eDNA Metabarcoding in the World's Largest Tropical Forest Country"*. It uses the species data prepared in `1_Prepare_data.Rmd` and the phylogenetic model of database inclusion fitted in `3_Drivers_of_database_omission.Rmd`.
+
+In this document, we calculate a Barcoding Priority Score (BPS) for each Brazilian mammal species, from a global and a local (Brazilian) perspective, assign species to priority categories, and map the spatial distribution of barcoding priorities across Brazil.
+
+**Inputs:** `output/intermediate/1_Prepare_data.rds` (Part 1), `output/intermediate/3_Drivers_of_database_omission.rds` and `output/models/fit_2.rds` (Part 3), and the range maps in `data/Range_maps/MDD_v1.2/` (Part 1). Biome borders (IBGE, via geobr) and the Natural Earth context layers are downloaded and cached on first run.
+
+**Outputs:** Figures 4 and 5, Figs S51-S53, Tables S4 and S5 (global and local priority species), additional tables, and `output/intermediate/4_Barcoding_priorities.rds`.
+
+Calculating evolutionary distinctiveness takes several hours. Its results are cached (see section 1.1), as are other slow or online steps.
+
+# 0. Priors
+
+**Load R packages:**
+
+```{r}
+
+library(here)
+library(ape)
+library(phylobase)
+library(data.table)
+library(brms)
+library(future)
+library(furrr)
+library(progressr)
+library(ggtree)
+library(ggtreeExtra)
+library(ggnewscale)
+library(ggstar)
+library(scico)
+library(sf)
+library(terra)
+library(stars)
+library(rnaturalearth)
+library(rnaturalearthdata)
+library(geobr)
+library(ggspatial)
+library(ggrepel)
+library(ggtext)
+library(patchwork)
+library(rmdd)
+
+# Loaded last so that these functions are not masked by functions with the
+# same name in other packages
+library(magrittr)
+library(purrr)
+library(tidyr)
+library(dplyr)
+library(stringr)
+library(ggplot2)
+
+```
+
+**Load data from Parts 1 and 3:**
+
+```{r}
+
+load_step("1_Prepare_data", c(
+  "brz_mam_metadata",
+  "brz_mam_taxonomy",
+  "brz_mam_synonyms",
+  "brz_mam_tree",
+  "phylacine_tree_grafted",
+  "iucn_data_global",
+  "iucn_data_brz",
+  "range_map_files",
+  "species_without_range_map"
+))
+
+load_step("3_Drivers_of_database_omission", c(
+  "brz_mam_completeness_traits_all",
+  "phylacine_average_vcv_matrix_brz"
+))
+
+fit_2 <- readRDS(paste0(model_file("fit_2"), ".rds"))
+
+```
+
+**Caching of slow or online steps:**
+
+The calculation of evolutionary distinctiveness, the retrieval of common names, the processing of the range maps and the download of the context layers for the maps are cached in `output/cache/`. Set `rebuild_cache <- TRUE` to recompute all cached steps, or delete individual files in `output/cache/`.
+
+```{r}
+
+rebuild_cache <- FALSE
+
+needs_build <- function(name) {
+  rebuild_cache || !file.exists(cache_file(name))
+}
+
+```
+
+# 1. Barcoding priority score
+
+We combine each species' probability of being omitted from reference databases, estimated with the phylogenetic model (Model 2) in Part 3, with its extinction risk and evolutionary distinctiveness, following the EDGE2 framework (Gumbs et al. 2023).
+
+[**The Barcoding Priority Score combines three components**]{.underline}:
+
+- **Probability of omission (PO):** a value between 0 and 1, where 0 means the species is certainly included in eDNA reference databases and 1 means it is certainly omitted. We draw 1000 samples from the posterior distribution of each species' predicted probability of inclusion, pooled across primers, and take one minus their median and 95% credible interval.
+
+- **Extinction risk (GE2 and LE2):** the probability of extinction over a 50-year horizon, based on the IUCN Red List for the global perspective (GE2) and on SALVE, the Brazilian national red list, for the local perspective (LE2). Red List categories are converted to extinction probabilities following Mooers et al. (2008) and Gumbs et al. (2023): Critically Endangered, 0.97; Endangered, 0.485; Vulnerable, 0.2425; Near Threatened, 0.12125; Least Concern, 0.060625. Following Gumbs et al. (2023), extinction probabilities are drawn from a distribution around each category value. For Data Deficient and unassessed species, they are drawn from the distribution across all categories. Extinct species receive an extinction probability of 1.
+
+- **Evolutionary distinctiveness (ED2):** the amount of evolutionary history a species represents, accounting for the extinction risk of its relatives (Gumbs et al. 2023). It is calculated from the global phylogeny (global perspective) and from the phylogeny of Brazilian mammals only (local perspective), across 100 phylogenetic trees and 100 draws of extinction probabilities per tree.
+
+The scores are calculated as:
+
+- Global: BPS~global~ = ED2~global~ × GE2 × PO
+- Local: BPS~local~ = ED2~local~ × LE2 × PO
+
+## 1.1. Components of the score
+
+**Probability of omission:**
+
+```{r}
+
+# 1. Posterior draws of the probability of inclusion for each species-primer
+#    combination (1000 draws), including the primer and phylogenetic effects
+
+set.seed(12345)
+
+inclusion_draws <- brms::posterior_epred(
+  fit_2,
+  resp = "presence",
+  re_formula = ~ (1 | primer) + (1 | gr(binomial, cov = phylacine_average_vcv_matrix_brz)),
+  ndraws = 1000
+)
+
+# 2. Probability of omission per species, pooling the draws across primers
+#    (the upper quantile of inclusion gives the lower bound of omission)
+
+preds_summary <- data.frame(
+  binomial       = rep(as.character(fit_2$data$binomial), each = nrow(inclusion_draws)),
+  inclusion_prob = as.vector(inclusion_draws)
+) %>%
+  group_by(binomial) %>%
+  summarise(
+    median_exclusion_prob = 1 - median(inclusion_prob),
+    lower_exclusion_prob  = 1 - quantile(inclusion_prob, probs = 0.975),
+    upper_exclusion_prob  = 1 - quantile(inclusion_prob, probs = 0.025),
+    .groups = "drop"
+  )
+
+# Agreement between modelled PO and observed omission across primers
+
+obs_omission <- fit_2$data %>%
+  group_by(binomial) %>%
+  summarise(obs_omission = 1 - mean(presence), .groups = "drop")
+
+po_check <- preds_summary %>% inner_join(obs_omission, by = "binomial")
+
+po_cor <- cor.test(po_check$median_exclusion_prob, po_check$obs_omission,
+                   method = "spearman", exact = FALSE)
+
+po_cor
+
+cat("Spearman correlation between modelled PO and observed omission:",
+    round(po_cor$estimate, 2), "\n")
+
+rm(obs_omission, po_check, po_cor)
+rm(inclusion_draws)
+
+```
+
+**Extinction risk and evolutionary distinctiveness:**
+
+The calculation of evolutionary distinctiveness takes several hours (100 trees × 100 draws of extinction probabilities, for the global and the Brazilian phylogeny). Its results are therefore cached in `output/cache/edge2_scores.rds`, and later runs load the cached results instead of recalculating them. The analysis can be rerun from the cached file without repeating this step. To recalculate it, delete this file or set `rebuild_cache <- TRUE`.
+
+The extinction probabilities below are only needed to calculate evolutionary distinctiveness, so both steps are skipped when the cached results are available.
+
+```{r}
+
+build_edge2 <- needs_build("edge2_scores.rds")
+
+# Status used for the local perspective: SALVE, with missing assessments
+# treated as unassessed
+
+salve_data <- brz_mam_metadata %>%
+  transmute(binomial,
+            salve_status = ifelse(salve_status == "Missing", "UA", salve_status))
+
+table(iucn_data_global$iucn_status, useNA = "ifany")
+table(salve_data$salve_status, useNA = "ifany")
+
+```
+
+```{r}
+
+if (build_edge2) {
+  
+  set.seed(12345)
+  
+  # 1. Distribution of extinction probabilities per Red List category
+  #    (adapted from Gumbs et al. 2023)
+  
+  pext_vals <- data.frame(rl_cat = rev(c("CR", "EN", "VU", "NT", "LC")),
+                          pext   = rev(c(0.97, 0.97 / 2, 0.97 / 4, 0.97 / 8, 0.97 / 16)))
+  
+  GE_2_calc <- function(pext) {
+    
+    iucn <- sample(1:5, size = 1000000, replace = TRUE)
+    
+    data <- data.frame(species = c(1:1000000), pext = pext$pext[iucn])
+    data <- data[order(data$pext), ]
+    data$rank <- seq_len(nrow(data))
+    
+    rank <- c(0, with(data, tapply(rank, pext, median)))
+    pext_tap <- c(0, pext$pext)
+    rank_sq <- rank^2; rank_cub <- rank^3; rank_qu <- rank^4; rank_quu <- rank^5
+    
+    model <- lm(pext_tap ~ rank + rank_sq + rank_cub + rank_qu)
+    
+    data$rank_sq <- data$rank^2; data$rank_cub <- data$rank^3; data$rank_qu <- data$rank^4; data$rank_quu <- data$rank^5
+    data$rank_pext <- predict(model, data)
+    data$rank_pext[data$rank_pext <= 0] <- 0.0001
+    data$rank_pext[data$rank_pext >= 1] <- 0.9999
+    
+    pext_LC <- data.frame(RL_cat = "LC", pext = data$rank_pext[data$pext == pext_tap[2]])
+    pext_NT <- data.frame(RL_cat = "NT", pext = data$rank_pext[data$pext == pext_tap[3]])
+    pext_VU <- data.frame(RL_cat = "VU", pext = data$rank_pext[data$pext == pext_tap[4]])
+    pext_EN <- data.frame(RL_cat = "EN", pext = data$rank_pext[data$pext == pext_tap[5]])
+    pext_CR <- data.frame(RL_cat = "CR", pext = data$rank_pext[data$pext == pext_tap[6]])
+    
+    pext_obj <- rbind(pext_CR, pext_EN, pext_VU, pext_NT, pext_LC)
+    pext_obj_sample <- NULL
+    
+    for (i in unique(pext_obj$RL_cat)) {
+      
+      a <- pext_obj$pext[pext_obj$RL_cat == i]
+      
+      if (median(a) < pext$pext[pext$rl_cat == i]) {
+        while (median(a) < pext$pext[pext$rl_cat == i]) {
+          a <- a[-sample(c(1:length(a)), 50, prob = rev(a))]
+        }
+      } else {
+        while (median(a) > pext$pext[pext$rl_cat == i]) {
+          a <- a[-sample(c(1:length(a)), 50, prob = a)]
+        }
+      }
+      
+      pext_obj_sample <- rbind(pext_obj_sample, data.frame(RL_cat = i, pext = a))
+    }
+    
+    pext_obj_sample
+  }
+  
+  extinction_prob_distribution <- GE_2_calc(pext = pext_vals)
+  
+  # 2. Draw 500 extinction probabilities per species. Data Deficient and
+  #    unassessed species are drawn from the distribution across all categories;
+  #    extinct species receive 1; species whose status is Not Applicable receive
+  #    a low value (0.001).
+  
+  known_status <- c("CR", "EN", "VU", "NT", "LC", "DD", "UA", "EX", "EW", "RE", "NA")
+  
+  sample_pext <- function(status, n = 500) {
+    if (!status %in% known_status) {
+      warning("Unknown status '", status, "' treated as unassessed")
+      status <- "UA"
+    }
+    if (status %in% c("UA", "DD")) {
+      return(sample(extinction_prob_distribution$pext, size = n, replace = TRUE))
+    }
+    if (status %in% c("EX", "EW", "RE")) {
+      return(rep(1, n))
+    }
+    if (status == "NA") {
+      return(rep(0.001, n))
+    }
+    sample(extinction_prob_distribution$pext[extinction_prob_distribution$RL_cat == status],
+           size = n, replace = TRUE)
+  }
+  
+  # Global perspective: IUCN status of all species in the global phylogeny
+  
+  results_global <- data.table::data.table(
+    binomial = rep(iucn_data_global$binomial, each = 500),
+    pext     = unlist(lapply(iucn_data_global$iucn_status, sample_pext))
+  )
+  
+  # Local perspective: SALVE status of Brazilian species
+  
+  results_brz <- data.table::data.table(
+    binomial = rep(salve_data$binomial, each = 500),
+    pext     = unlist(lapply(salve_data$salve_status, sample_pext))
+  )
+  
+  rm(pext_vals, GE_2_calc, extinction_prob_distribution, known_status, sample_pext)
+}
+
+```
+
+```{r}
+
+if (build_edge2) {
+  
+  # 1. Reorder the edges of a phylo4 tree
+  
+  reorder_tree <- function(tree, ordering) {
+    tree@edge.length <- tree@edge.length[ordering]
+    tree@edge <- tree@edge[ordering, ]
+    tree
+  }
+  
+  # 2. EDGE2 for one tree and one set of extinction probabilities
+  #    (adapted from Gumbs et al. 2023)
+  
+  EDGE2_mod <- function(tree, pext) {
+    
+    N_species <- length(tree$tip.label)
+    N_nodes <- tree$Nnode
+    N_tot <- N_species + N_nodes
+    
+    tree_dat <- data.frame(
+      Species = as.character(tree$tip.label),
+      TBL     = NA,
+      pext    = pext$pext,
+      ED      = NA,
+      EDGE    = NA
+    )
+    
+    if (!inherits(tree, "phylo4")) {
+      tree <- as(tree, "phylo4")
+    }
+    
+    root <- rootNode(tree)
+    nodes <- c(root, descendants(tree, root, "all"))
+    ord <- order(nodes)
+    tree <- reorder_tree(tree, ord)
+    nodes <- nodes[ord]
+    
+    tree_dat$TBL <- tree@edge.length[1:N_species]
+    
+    node_data <- data.frame(Node = 1:N_tot, Pext = rep(1, N_tot), Edge_Sum = NA)
+    node_data$Pext[1:N_species] <- pext$pext
+    
+    # Propagate extinction probabilities up the tree
+    for (i in c(1:length(tree@label), N_tot:(root + 1))) {
+      anc <- tree@edge[i, 1]
+      node_data$Pext[anc] <- node_data$Pext[anc] * node_data$Pext[i]
+    }
+    
+    # Weight edge lengths by the probability that all descendants go extinct
+    tree@edge.length <- tree@edge.length * node_data$Pext
+    
+    if (is.na(tree@edge.length[root])) {
+      tree@edge.length[root] <- 0
+    }
+    
+    node_data$Edge_Sum[root] <- tree@edge.length[root]
+    
+    # Accumulate edge lengths from the root
+    for (i in (root + 1):N_tot) {
+      ans <- tree@edge[i, 1]
+      node_data$Edge_Sum[i] <- node_data$Edge_Sum[ans] + tree@edge.length[i]
+    }
+    
+    for (i in 1:N_species) {
+      ans <- tree@edge[i, 1]
+      tree_dat$EDGE[i] <- node_data$Edge_Sum[ans] + tree@edge.length[i]
+    }
+    
+    tree_dat$ED <- tree_dat$EDGE / tree_dat$pext
+    
+    tree_dat
+  }
+  
+  # 3. Scores for 100 trees and 100 draws of extinction probabilities per tree.
+  #    Only the Brazilian species are kept from the global trees.
+  
+  run_edge2 <- function(trees, pext_draws, seeds, keep_species) {
+    
+    plan(multisession, workers = 4)
+    on.exit(plan(sequential))
+    
+    with_progress({
+      p <- progressor(steps = length(trees))
+      
+      scores <- future_map2(trees, seeds, function(tree, seed) {
+        p()
+        set.seed(seed)
+        species_order <- tree$tip.label
+        
+        draws <- replicate(100, {
+          sampled <- pext_draws[, .SD[sample(.N, 1)], by = binomial]
+          setnames(sampled, c("binomial", "pext"), c("species", "pext"))
+          sampled[match(species_order, species), .(species, pext)]
+        }, simplify = FALSE)
+        
+        data.table::rbindlist(lapply(draws, function(d) {
+          scores_tree <- EDGE2_mod(tree = tree, pext = d)
+          scores_tree[scores_tree$Species %in% keep_species, ]
+        }))
+      }, .options = furrr_options(seed = TRUE, packages = c("phylobase", "data.table")))
+    })
+    
+    data.table::rbindlist(scores)
+  }
+  
+  set.seed(42)
+  seeds <- sample.int(.Machine$integer.max, 100)
+  
+  EDGE2_global <- run_edge2(phylacine_tree_grafted, results_global, seeds, brz_mam_taxonomy$binomial)
+  EDGE2_brz    <- run_edge2(brz_mam_tree, results_brz, seeds, brz_mam_taxonomy$binomial)
+  
+  saveRDS(list(EDGE2_global = EDGE2_global, EDGE2_brz = EDGE2_brz), cache_file("edge2_scores.rds"))
+  
+  rm(reorder_tree, EDGE2_mod, run_edge2, seeds, results_global, results_brz,
+     EDGE2_global, EDGE2_brz)
+}
+
+list2env(readRDS(cache_file("edge2_scores.rds")), envir = environment())
+
+rm(build_edge2)
+
+```
+
+## 1.2. Barcoding priority scores and priority categories
+
+For each species and each combination of tree and extinction-probability draw, the score is calculated with the median, lower and upper bound of the probability of omission. Species are assigned to a priority category when the lower bound of their score exceeds the median score of all species in more than 95% of the combinations, i.e. when they have a high priority even under conservative assumptions about their omission from reference databases. The category depends on their conservation status: IUCN status for the global perspective, and SALVE status for the local perspective.
+
+- **Highest priority:** threatened species (VU, EN, CR, EW).
+- **Near priority:** threatened species that exceed the median in 80-95% of the combinations.
+- **Research priority:** Data Deficient and unassessed species.
+- **Watch priority:** Least Concern and Near Threatened species.
+
+```{r}
+
+# 1. Score, priority categories and summaries per species for one perspective
+
+threatened <- c("VU", "EN", "CR", "EW")
+
+priority_scores <- function(edge2, status, suffix) {
+  
+  # One status per species (the status tables can list a species twice)
+  status <- distinct(status, binomial, .keep_all = TRUE)
+  
+  combined <- edge2 %>%
+    filter(Species %in% brz_mam_taxonomy$binomial) %>%
+    rename(binomial = Species) %>%
+    merge(status, by = "binomial") %>%
+    merge(preds_summary, by = "binomial") %>%
+    mutate(BREDGE_median = EDGE * median_exclusion_prob,
+           BREDGE_lower  = EDGE * lower_exclusion_prob,
+           BREDGE_upper  = EDGE * upper_exclusion_prob)
+  
+  median_score <- median(combined$BREDGE_median)
+  
+  combined %>%
+    group_by(binomial) %>%
+    summarise(
+      status          = first(status),
+      prop_above_median = mean(BREDGE_lower > median_score, na.rm = TRUE),
+      BREDGE_list     = prop_above_median > 0.95 & status %in% threatened,
+      BREDGE_res      = prop_above_median > 0.95 & status %in% c("UA", "DD"),
+      BREDGE_watch    = prop_above_median > 0.95 & status %in% c("LC", "NT"),
+      BREDGE_border   = prop_above_median < 0.95 & prop_above_median > 0.80 & status %in% threatened,
+      
+      median_BREDGE   = median(BREDGE_median, na.rm = TRUE),
+      lower_BREDGE    = median(BREDGE_lower, na.rm = TRUE),
+      upper_BREDGE    = median(BREDGE_upper, na.rm = TRUE),
+      
+      median_exclusion_prob = median(median_exclusion_prob, na.rm = TRUE),
+      lower_exclusion_prob  = median(lower_exclusion_prob, na.rm = TRUE),
+      upper_exclusion_prob  = median(upper_exclusion_prob, na.rm = TRUE),
+      
+      median_EDGE     = median(EDGE, na.rm = TRUE),
+      lower_EDGE      = quantile(EDGE, probs = 0.025, na.rm = TRUE),
+      upper_EDGE      = quantile(EDGE, probs = 0.975, na.rm = TRUE),
+      
+      median_ED       = median(ED, na.rm = TRUE),
+      lower_ED        = quantile(ED, probs = 0.025, na.rm = TRUE),
+      upper_ED        = quantile(ED, probs = 0.975, na.rm = TRUE),
+      
+      median_TBL      = median(TBL, na.rm = TRUE),
+      lower_TBL       = quantile(TBL, probs = 0.025, na.rm = TRUE),
+      upper_TBL       = quantile(TBL, probs = 0.975, na.rm = TRUE),
+      
+      median_pext     = median(pext, na.rm = TRUE),
+      lower_pext      = quantile(pext, probs = 0.025, na.rm = TRUE),
+      upper_pext      = quantile(pext, probs = 0.975, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    rename_with(~ paste0(.x, "_", suffix), -binomial)
+}
+
+# 2. Global (IUCN status) and local (SALVE status) perspectives
+
+EDGE2_global_species <- priority_scores(
+  EDGE2_global,
+  rename(iucn_data_global, status = iucn_status),
+  "global"
+) %>%
+  rename(iucn_status = status_global)
+
+EDGE2_brz_species <- priority_scores(
+  EDGE2_brz,
+  rename(salve_data, status = salve_status),
+  "brz"
+) %>%
+  rename(salve_status = status_brz)
+
+EDGE2_species <- merge(EDGE2_global_species, EDGE2_brz_species, by = "binomial")
+
+save_table(EDGE2_species, "barcoding_priority_scores_all_species", type = "additional")
+
+rm(threatened, priority_scores, EDGE2_global, EDGE2_brz, EDGE2_global_species, EDGE2_brz_species)
+
+```
+
+**Priority categories per perspective:**
+
+Each species has one category per perspective. Because the two perspectives use different red lists (IUCN and SALVE), a species can have different categories in the two perspectives. Categories are therefore always reported per perspective (tables, maps and statistics), so that no species is counted twice. Where the perspectives are combined (the number of priority species overall and per order, and the combined priority map), a species is counted once if it is a priority from at least one perspective, regardless of its category. Conservation priority combines the highest and near priority categories.
+
+```{r}
+
+# 1. Check that the categories are mutually exclusive within each perspective
+
+stopifnot(
+  all(rowSums(EDGE2_species[, c("BREDGE_list_global", "BREDGE_border_global",
+                                "BREDGE_res_global", "BREDGE_watch_global")]) <= 1),
+  all(rowSums(EDGE2_species[, c("BREDGE_list_brz", "BREDGE_border_brz",
+                                "BREDGE_res_brz", "BREDGE_watch_brz")]) <= 1)
+)
+
+# 2. Category of each species per perspective, and whether it is a priority
+#    from one or both perspectives
+
+category_label <- function(list, border, res, watch) {
+  case_when(
+    list   ~ "Highest priority",
+    border ~ "Near priority",
+    res    ~ "Research priority",
+    watch  ~ "Watch priority",
+    TRUE   ~ "None"
+  )
+}
+
+priority_species_flags <- EDGE2_species %>%
+  transmute(
+    binomial,
+    global_category = category_label(BREDGE_list_global, BREDGE_border_global, BREDGE_res_global, BREDGE_watch_global),
+    local_category  = category_label(BREDGE_list_brz, BREDGE_border_brz, BREDGE_res_brz, BREDGE_watch_brz)
+  ) %>%
+  mutate(
+    priority_global = global_category != "None",
+    priority_local  = local_category != "None",
+    priority_any    = priority_global | priority_local,
+    priority_from   = case_when(priority_global & priority_local ~ "Both",
+                                priority_global                  ~ "Global only",
+                                priority_local                   ~ "Local only",
+                                TRUE                             ~ "None"),
+    has_range_map   = !binomial %in% species_without_range_map
+  ) %>%
+  left_join(brz_mam_taxonomy[, c("binomial", "order")], by = "binomial")
+
+# 3. One row per species and perspective in which it is a priority, with its
+#    category group (conservation = highest + near priority)
+
+priority_long <- priority_species_flags %>%
+  select(binomial, order, has_range_map, global = global_category, local = local_category) %>%
+  pivot_longer(c(global, local), names_to = "perspective", values_to = "category") %>%
+  filter(category != "None") %>%
+  mutate(group = case_when(category %in% c("Highest priority", "Near priority") ~ "conservation",
+                           category == "Research priority"                     ~ "research",
+                           category == "Watch priority"                        ~ "watch"))
+
+rm(category_label)
+
+```
+
+**Statistics reported in the main text:**
+
+```{r}
+
+# 1. Species per category and perspective (each species once per perspective)
+
+category_counts <- priority_long %>%
+  count(perspective, category) %>%
+  pivot_wider(names_from = perspective, values_from = n, values_fill = 0)
+
+category_counts
+
+group_counts <- priority_long %>%
+  count(perspective, group) %>%
+  pivot_wider(names_from = perspective, values_from = n, values_fill = 0)
+
+group_counts
+
+# 2. Priority species overall (each species once) and agreement between perspectives
+
+priority_species_flags %>%
+  count(priority_from)
+
+# Highest priority from one or both perspectives (Fig. 4c)
+
+table(global = EDGE2_species$BREDGE_list_global, local = EDGE2_species$BREDGE_list_brz)
+
+# 3. Species without a range map, per perspective and category group, and for
+#    all priority species combined (each species once)
+
+missing_range_maps <- bind_rows(
+  priority_long %>%
+    group_by(perspective, group) %>%
+    summarise(n_species = n(), n_without_map = sum(!has_range_map), .groups = "drop"),
+  priority_species_flags %>%
+    filter(priority_any) %>%
+    summarise(n_species = n(), n_without_map = sum(!has_range_map)) %>%
+    mutate(perspective = "either", group = "any")
+) %>%
+  mutate(percent_without_map = n_without_map / n_species * 100)
+
+missing_range_maps
+
+```
+
+# 2. Priority species lists
+
+**Common names:**
+
+Common names of the priority species are taken from the Mammal Diversity Database (bundled in the `rmdd` package), matched on accepted names and then synonyms, with manual names for species that cannot be matched.
+
+```{r}
+
+# Common names from the Mammal Diversity Database (bundled in the rmdd package)
+
+mdd_key <- function(x) tolower(gsub("[_ ]+", " ", trimws(x)))
+
+# 1. Accepted MDD names
+mdd      <- rmdd::mdd_checklist
+accepted <- setNames(mdd$main_common_name, mdd_key(mdd$sci_name))
+
+# 2. Synonyms and old combinations that point to exactly one accepted species
+syn <- unique(data.frame(
+  key      = mdd_key(rmdd::mdd_synonyms$mdd_original_combination),
+  accepted = mdd_key(rmdd::mdd_synonyms$mdd_species)
+))
+syn <- syn[!is.na(syn$key) & syn$accepted %in% names(accepted), ]
+syn <- syn[!syn$key %in% syn$key[duplicated(syn$key)], ]
+synonyms <- setNames(accepted[syn$accepted], syn$key)
+
+# 3. Look up priority species: accepted name first, then synonym
+priority_species <- priority_species_flags$binomial[priority_species_flags$priority_any]
+keys <- mdd_key(priority_species)
+
+common_names <- unname(accepted[keys])
+via_synonym  <- is.na(common_names) & keys %in% names(synonyms)
+common_names[via_synonym] <- unname(synonyms[keys[via_synonym]])
+names(common_names) <- priority_species
+
+# 4. Manual names for anything MDD cannot resolve, or where you prefer another name
+common_name_overrides <- c(
+  "Aotus infulatus"          = "Feline Night Monkey",
+  "Pithecia inusta"          = "Burnished Saki",
+  "Alouatta puruensis"       = "Purus Red Howler",
+  "Metachirus arinatai"      = "Aritana's Brown Four-eyed Opossum",
+
+  "Rhipidomys cearanus"      = "Ceará Climbing Mouse",
+  "Rhipidomys baturiteensis" = "Baturité Climbing Mouse",
+  "Sylvilagus minensis"      = "Minas Gerais Tapeti",
+  "Sylvilagus paraguensis"   = "Paraguayan Tapeti",
+  "Makalata obscura"         = "Dusky Spiny Tree-rat"
+)
+
+overrides <- intersect(names(common_name_overrides), priority_species)
+common_names[overrides] <- common_name_overrides[overrides]
+
+# 5. Report what needs a look
+
+if (any(via_synonym)) {
+  message("Matched via MDD synonym:\n",
+          paste0("  ", priority_species[via_synonym], " -> ", common_names[via_synonym], collapse = "\n"))
+}
+
+if (anyNA(common_names)) {
+  warning("No MDD match for: ", paste(names(common_names)[is.na(common_names)], collapse = ", "))
+}
+
+shared <- lapply(split(names(common_names), tolower(trimws(common_names))), unique)
+
+shared <- shared[lengths(shared) > 1]
+
+if (length(shared) > 0) {
+  warning("Common name shared by more than one species:\n",
+          paste0("  ", vapply(shared, function(b) common_names[[b[1]]], character(1)), ": ",
+                 vapply(shared, paste, character(1), collapse = ", "), collapse = "\n"))
+}
+
+rm(mdd_key, mdd, accepted, syn, synonyms, keys, via_synonym, common_name_overrides, overrides, shared)
+
+```
+
+**Tables of priority species (Tables S4 and S5):**
+
+Table S4 lists the global priority species and Table S5 the local priority species. Each species appears once per table, in its category from that perspective, and the table also gives its category from the other perspective for cross-reference. Both tables are saved with one row per species (`TableS4_global_priority_species`, `TableS5_local_priority_species`) and in the layout of the Supplementary Information, with one section per category (`..._formatted`).
+
+```{r}
+
+category_levels <- c("Highest priority", "Near priority", "Research priority", "Watch priority")
+
+# 1. Priority table for one perspective, ordered by category and score
+
+make_priority_table <- function(perspective) {
+  
+  sfx        <- if (perspective == "global") "global" else "brz"
+  own        <- paste0(perspective, "_category")
+  other      <- if (perspective == "global") "local_category" else "global_category"
+  status_col <- if (perspective == "global") "iucn_status" else "salve_status"
+  status_lab <- if (perspective == "global") "IUCN status" else "SALVE status"
+  pext_lab   <- if (perspective == "global") "GE2" else "LE2"
+  other_lab  <- if (perspective == "global") "Local category" else "Global category"
+  
+  EDGE2_species %>%
+    left_join(priority_species_flags %>% select(binomial, order, global_category, local_category),
+              by = "binomial") %>%
+    filter(.data[[own]] != "None") %>%
+    mutate(category = factor(.data[[own]], levels = category_levels)) %>%
+    arrange(category, desc(.data[[paste0("median_BREDGE_", sfx)]])) %>%
+    transmute(
+      Category       = as.character(category),
+      Order          = order,
+      Species        = binomial,
+      `Common name`  = ifelse(is.na(common_names[binomial]), "/", common_names[binomial]),
+      !!status_lab  := .data[[status_col]],
+      BPS            = round(.data[[paste0("median_BREDGE_", sfx)]], 3),
+      `BPS (95% CI)` = paste0(round(.data[[paste0("lower_BREDGE_", sfx)]], 3), "-",
+                              round(.data[[paste0("upper_BREDGE_", sfx)]], 3)),
+      !!pext_lab    := round(.data[[paste0("median_pext_", sfx)]], 3),
+      ED2            = round(.data[[paste0("median_ED_", sfx)]], 3),
+      PO             = round(median_exclusion_prob_global, 3),
+      !!other_lab   := ifelse(.data[[other]] == "None", "Not a priority", .data[[other]])
+    )
+}
+
+# 2. Layout of the Supplementary Information: one section per category
+
+format_priority_table <- function(tbl) {
+  bind_rows(lapply(category_levels, function(cat) {
+    rows <- tbl %>%
+      filter(Category == cat) %>%
+      select(-Category) %>%
+      mutate(across(everything(), as.character))
+    heading <- tibble::add_row(rows[0, ], Order = paste0(toupper(cat), " SPECIES (N = ", nrow(rows), ")"))
+    blank   <- tibble::add_row(rows[0, ], Order = "")
+    bind_rows(blank, heading, blank, rows)
+  }))
+}
+
+# 3. Table S4 (global) and Table S5 (local)
+
+table_s4 <- make_priority_table("global")
+table_s5 <- make_priority_table("local")
+
+# Each species appears once per table
+stopifnot(!any(duplicated(table_s4$Species)), !any(duplicated(table_s5$Species)))
+
+save_table(table_s4, "TableS4_global_priority_species", type = "supplementary")
+save_table(table_s5, "TableS5_local_priority_species", type = "supplementary")
+
+readr::write_excel_csv(format_priority_table(table_s4),
+                       file.path(table_dir("supplementary"), "TableS4_global_priority_species_formatted.csv"),
+                       na = "")
+readr::write_excel_csv(format_priority_table(table_s5),
+                       file.path(table_dir("supplementary"), "TableS5_local_priority_species_formatted.csv"),
+                       na = "")
+
+rm(category_levels, make_priority_table, format_priority_table, table_s4, table_s5)
+
+```
+
+# 3. Figures of barcoding priorities
+
+**Global and local ranks of the highest-priority species:**
+
+Ranks are calculated within each list: among the global highest-priority species for the global rank, and among the local highest-priority species for the local rank.
+
+```{r, fig.width=9, fig.height=9}
+
+# 1. Ranks within each highest-priority list
+
+EDGE2_species_ranking <- EDGE2_species %>%
+  select(binomial, BREDGE_list_global, BREDGE_list_brz, median_BREDGE_global, median_BREDGE_brz) %>%
+  filter(BREDGE_list_global | BREDGE_list_brz) %>%
+  mutate(
+    global_rank    = ifelse(BREDGE_list_global,
+                            rank(-ifelse(BREDGE_list_global, median_BREDGE_global, -Inf), ties.method = "min"),
+                            NA_real_),
+    brazilian_rank = ifelse(BREDGE_list_brz,
+                            rank(-ifelse(BREDGE_list_brz, median_BREDGE_brz, -Inf), ties.method = "min"),
+                            NA_real_),
+    direction = case_when(
+      is.na(global_rank)             ~ "brazil_only",
+      is.na(brazilian_rank)          ~ "global_only",
+      brazilian_rank > global_rank   ~ "less_priority_brazil",
+      brazilian_rank < global_rank   ~ "more_priority_brazil",
+      TRUE                           ~ "equal_priority"
+    ),
+    rank_diff      = abs(global_rank - brazilian_rank),
+    great_rankdiff = !is.na(rank_diff) & rank_diff > 5
+  )
+
+# 2. Background bands showing the size of rank differences. Both axes share
+#    the same range, so that the bands and the diagonal are symmetric.
+
+max_rank <- max(EDGE2_species_ranking$global_rank, EDGE2_species_ranking$brazilian_rank, na.rm = TRUE) + 2
+
+thresholds   <- c(1, 2, 5, 10, 15, max_rank)
+colors_above <- rep("#c8e6c9", length(thresholds) - 1)
+colors_below <- rep("#bbdefb", length(thresholds) - 1)
+alphas       <- seq(0.2, 1, length.out = length(thresholds) - 1)
+
+make_band <- function(thresh_low, thresh_high, max_rank, above = TRUE) {
+  if (above) {
+    data.frame(x = c(0, max_rank - thresh_high, max_rank - thresh_low, 0),
+               y = c(0 + thresh_high, max_rank, max_rank, 0 + thresh_low))
+  } else {
+    data.frame(x = c(0 + thresh_low, max_rank, max_rank, 0 + thresh_high),
+               y = c(0, max_rank - thresh_low, max_rank - thresh_high, 0))
+  }
+}
+
+p <- ggplot()
+
+for (i in seq_along(thresholds)[-1]) {
+  p <- p +
+    geom_polygon(data = make_band(thresholds[i - 1], thresholds[i], max_rank, above = TRUE),
+                 aes(x = x, y = y), fill = colors_below[i - 1], alpha = alphas[i - 1]) +
+    geom_polygon(data = make_band(thresholds[i - 1], thresholds[i], max_rank, above = FALSE),
+                 aes(x = x, y = y), fill = colors_above[i - 1], alpha = alphas[i - 1])
+}
+
+# 3. Species that are highest priority from both perspectives
+
+p_both <- p +
+  geom_abline(slope = 1, intercept = 0, linewidth = 1, linetype = "dashed", color = "gray20") +
+  geom_point(data = filter(EDGE2_species_ranking, !is.na(global_rank) & !is.na(brazilian_rank)),
+             aes(x = global_rank, y = brazilian_rank, fill = direction),
+             shape = 21, size = 2, stroke = 0, color = "transparent", alpha = 0.8) +
+  scale_fill_manual(values = c("less_priority_brazil" = "#1e88e5",
+                               "more_priority_brazil" = "#2c6e2f",
+                               "equal_priority"       = "gray50")) +
+  scale_x_reverse(position = "top", limits = c(max_rank, 0), expand = c(0, 0)) +
+  scale_y_reverse(position = "right", limits = c(max_rank, 0), expand = c(0, 0)) +
+  xlab("Global barcoding priority rank") +
+  ylab("Local barcoding priority rank") +
+  geom_text_repel(data = filter(EDGE2_species_ranking, great_rankdiff),
+                  aes(x = global_rank, y = brazilian_rank, label = binomial),
+                  size = 3, color = "black", fontface = "bold.italic", box.padding = 0.5, point.padding = 0.5,
+                  segment.size = 0.5, segment.color = "gray50", force = 1, max.overlaps = 10, alpha = 0.7) +
+  theme_minimal() +
+  theme(panel.grid = element_blank(),
+        panel.border = element_rect(color = "black", fill = NA, linewidth = 0.5),
+        axis.title.x.top = element_text(margin = margin(b = 20), size = 14),
+        axis.title.y.right = element_text(margin = margin(l = 20), size = 14),
+        legend.position = "none",
+        axis.text = element_text(size = 12))
+
+# 4. Species that are highest priority from one perspective only. Labels are
+#    placed at evenly spaced positions in rank order, and connected to their
+#    point with a line, so that they never overlap. Label style matches the
+#    main panel.
+
+side_theme <- theme_minimal() +
+  theme(axis.title = element_blank(), axis.text = element_blank(), panel.grid = element_blank(),
+        legend.position = "none", panel.border = element_rect(color = "black", fill = NA, linewidth = 0.5))
+
+# Local only (left panel): points along the right edge, labels in a column
+
+local_only <- EDGE2_species_ranking %>%
+  filter(is.na(global_rank) & !is.na(brazilian_rank)) %>%
+  arrange(brazilian_rank) %>%
+  mutate(label_y = seq(1, max_rank - 1, length.out = n()))
+
+p_brz_only <- ggplot(local_only) +
+  geom_segment(aes(x = 0.97, y = brazilian_rank, xend = 0.88, yend = label_y),
+               linewidth = 0.3, color = "gray60") +
+  geom_point(aes(x = 0.97, y = brazilian_rank),
+             fill = "#2c6e2f", shape = 21, size = 2, stroke = 0, color = "transparent", alpha = 0.8) +
+  geom_text(aes(x = 0.86, y = label_y, label = binomial),
+            hjust = 1, size = 3, fontface = "bold.italic", color = "black", alpha = 0.7) +
+  scale_x_continuous(limits = c(0, 1), expand = c(0, 0)) +
+  scale_y_reverse(limits = c(max_rank, 0), expand = c(0, 0)) +
+  side_theme
+
+# Global only (bottom panel): points along the top edge, labels in a row
+
+global_only <- EDGE2_species_ranking %>%
+  filter(is.na(brazilian_rank) & !is.na(global_rank)) %>%
+  arrange(global_rank) %>%
+  mutate(label_x = seq(1, max_rank - 1, length.out = n()))
+
+p_global_only <- ggplot(global_only) +
+  geom_segment(aes(x = global_rank, y = 0.97, xend = label_x, yend = 0.88),
+               linewidth = 0.3, color = "gray60") +
+  geom_point(aes(x = global_rank, y = 0.97),
+             fill = "#1e88e5", shape = 21, size = 2, stroke = 0, color = "transparent", alpha = 0.8) +
+  geom_text(aes(x = label_x, y = 0.86, label = binomial),
+            angle = 90, hjust = 1, size = 3, fontface = "bold.italic", color = "black", alpha = 0.7) +
+  scale_x_reverse(limits = c(max_rank, 0), expand = c(0, 0)) +
+  scale_y_continuous(limits = c(0, 1), expand = c(0, 0)) +
+  side_theme
+
+priority_rank_plot <- p_brz_only + p_both + plot_spacer() + p_global_only +
+  plot_layout(ncol = 2, nrow = 2, widths = c(2.4, 7), heights = c(7, 2.4))
+
+priority_rank_plot
+
+save_figure(priority_rank_plot, "Fig4c_priority_rank_global_vs_brazil", width = 9, height = 9)
+
+rm(max_rank, thresholds, colors_above, colors_below, alphas, make_band, p, i, side_theme,
+   local_only, global_only, p_both, p_global_only, p_brz_only, priority_rank_plot)
+
+```
+
+**Scores of the top-ranked highest-priority species:**
+
+The ten highest-ranked species from each perspective are shown, with the median score and the range obtained with the lower and upper bounds of the probability of omission. Species are labelled with their common and scientific name, and ordered by their mean rank across the two perspectives (shown next to the name).
+
+```{r, fig.width=7, fig.height=7}
+
+# 1. Top 10 species from each highest-priority list. For ordering and labels,
+#    all highest-priority species are ranked on both scores, so that every
+#    species has a global and a local rank, and their mean.
+
+top_species <- EDGE2_species_ranking %>%
+  mutate(rank_global_all = rank(-median_BREDGE_global, ties.method = "min"),
+         rank_local_all  = rank(-median_BREDGE_brz, ties.method = "min"),
+         mean_rank       = (rank_global_all + rank_local_all) / 2) %>%
+  filter((!is.na(global_rank) & global_rank <= 10) | (!is.na(brazilian_rank) & brazilian_rank <= 10)) %>%
+  arrange(desc(mean_rank))
+
+# 2. Scores from both perspectives
+
+EDGE2_species_scores <- EDGE2_species %>%
+  filter(binomial %in% top_species$binomial) %>%
+  select(binomial,
+         median_BREDGE_global, lower_BREDGE_global, upper_BREDGE_global,
+         median_BREDGE_brz, lower_BREDGE_brz, upper_BREDGE_brz) %>%
+  pivot_longer(-binomial, names_to = c(".value", "region"),
+               names_pattern = "(median|lower|upper)_BREDGE_(.*)") %>%
+  mutate(binomial  = factor(binomial, levels = top_species$binomial),
+         region    = factor(region, levels = c("global", "brz"), labels = c("Global", "Local")),
+         dodge_pos = as.numeric(binomial) + ifelse(region == "Global", -0.2, 0.2))
+
+# 3. Positions on the (log) score axis: the bars start at bar_start, and the
+#    mean ranks are shown in the empty strip to the left of the bars
+
+bar_start  <- min(EDGE2_species_scores$lower) * 0.8
+rank_pos   <- bar_start * 0.7
+axis_start <- bar_start * 0.5
+
+rank_labels <- top_species %>%
+  mutate(position = match(binomial, levels(EDGE2_species_scores$binomial)),
+         label    = sprintf("%.1f", mean_rank))
+
+# 4. Plot
+
+barcode_priority_scores_plot <- ggplot(EDGE2_species_scores, aes(x = dodge_pos, y = median, group = region)) +
+  geom_segment(aes(xend = dodge_pos, y = bar_start, yend = median, color = region), linewidth = 6) +
+  scale_color_manual(values = c("Global" = "#bbdefb", "Local" = "#c8e6c9")) +
+  new_scale_color() +
+  geom_errorbar(aes(ymin = lower, ymax = upper, color = region), width = 0, linewidth = 0.75) +
+  scale_color_manual(values = c("Global" = "#1e88e5", "Local" = "#2c6e2f")) +
+  geom_point(aes(y = median), color = "black", fill = "white", stroke = 1, shape = 21, size = 2) +
+  geom_text(data = rank_labels, aes(x = position, y = rank_pos, label = label),
+            inherit.aes = FALSE, size = 4, fontface = "bold", color = "black") +
+  scale_x_continuous(breaks = seq_along(levels(EDGE2_species_scores$binomial)),
+                     labels = levels(EDGE2_species_scores$binomial),
+                     expand = expansion(mult = c(0.05, 0.05))) +
+  labs(x = NULL, y = "Barcoding priority score (BPS)") +
+  coord_flip() +
+  scale_y_log10(limits = c(axis_start, NA), expand = expansion(mult = c(0, 0.1))) +
+  theme_minimal() +
+  theme(panel.border = element_rect(color = "black", fill = NA, linewidth = 0.5),
+        panel.grid = element_blank(),
+        axis.text.x = element_text(size = 14),
+        axis.text.y = element_text(size = 12, face = "italic"),
+        axis.title.x = element_text(margin = margin(t = 20), size = 16),
+        legend.position = "none")
+
+barcode_priority_scores_plot
+
+save_figure(barcode_priority_scores_plot, "Fig4b_priority_species_scores", width = 7, height = 7)
+
+rm(top_species, EDGE2_species_scores, bar_start, rank_pos, axis_start, rank_labels,
+   barcode_priority_scores_plot, EDGE2_species_ranking)
+
+```
+
+**Priority categories per order:**
+
+```{r, fig.width=14, fig.height=7}
+
+# 1. Category of each species per perspective, as long data
+
+species_lists_long <- EDGE2_species %>%
+  merge(brz_mam_taxonomy[, c("binomial", "order")], by = "binomial") %>%
+  select(binomial, order,
+         BREDGE_list_global, BREDGE_border_global, BREDGE_res_global, BREDGE_watch_global,
+         BREDGE_list_brz, BREDGE_border_brz, BREDGE_res_brz, BREDGE_watch_brz) %>%
+  pivot_longer(cols = starts_with("BREDGE_"), names_to = c("type", "region"),
+               names_pattern = "BREDGE_(.*)_(.*)", values_to = "value") %>%
+  pivot_wider(names_from = type, values_from = value) %>%
+  mutate(list = case_when(list   ~ "Highest priority",
+                          border ~ "Near priority",
+                          res    ~ "Research priority",
+                          watch  ~ "Watch priority",
+                          TRUE   ~ "None"),
+         list = factor(list, levels = c("None", "Watch priority", "Research priority",
+                                        "Near priority", "Highest priority"))) %>%
+  select(-c(border, watch, res))
+
+# 2. Percentage of species in each order per category
+
+EDGE2_species_order <- species_lists_long %>%
+  group_by(order, region, list) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  complete(order, region, list, fill = list(n = 0)) %>%
+  group_by(order, region) %>%
+  mutate(prop = n / sum(n) * 100) %>%
+  ungroup() %>%
+  mutate(region_list = paste(region, list, sep = "_"))
+
+total_species_per_order <- EDGE2_species_order %>%
+  filter(region == "brz") %>%
+  group_by(order) %>%
+  summarise(total_species = sum(n), .groups = "drop")
+
+order_order <- EDGE2_species_order %>%
+  filter(list != "None") %>%
+  group_by(order) %>%
+  summarise(sum_prop = sum(prop), .groups = "drop") %>%
+  arrange(desc(sum_prop))
+
+EDGE2_species_order <- EDGE2_species_order %>%
+  filter(list != "None") %>%
+  mutate(mammal_order = factor(order, levels = order_order$order),
+         region       = factor(region, levels = c("brz", "global")))
+
+total_species_per_order <- total_species_per_order %>%
+  mutate(mammal_order = factor(order, levels = order_order$order))
+
+# 3. Plot
+
+colors_global <- sapply(seq(0, 0.8, 0.2), function(x) colorspace::lighten(col = "#8aa4e5", amount = x))[1:4]
+colors_brz    <- sapply(seq(0, 0.8, 0.2), function(x) colorspace::lighten(col = "#6ea777", amount = x))[1:4]
+
+priority_order_distribution <- ggplot(EDGE2_species_order,
+                                      aes(x = region, y = prop, fill = region_list, group = region)) +
+  geom_bar(stat = "identity", position = "stack") +
+  labs(x = "Taxonomic order", y = "Proportion of species in order belonging to priority list (%)",
+       fill = "Priority list") +
+  scale_y_continuous(labels = scales::percent_format(scale = 1)) +
+  scale_fill_manual(values = c(
+    "global_Highest priority"  = colors_global[1],
+    "global_Near priority"     = colors_global[2],
+    "global_Research priority" = colors_global[3],
+    "global_Watch priority"    = colors_global[4],
+    "brz_Highest priority"     = colors_brz[1],
+    "brz_Near priority"        = colors_brz[2],
+    "brz_Research priority"    = colors_brz[3],
+    "brz_Watch priority"       = colors_brz[4]),
+    breaks = c("brz_Highest priority", "brz_Near priority", "brz_Research priority", "brz_Watch priority",
+               "global_Highest priority", "global_Near priority", "global_Research priority", "global_Watch priority"),
+    labels = c("Local: Highest priority", "Local: Near priority",
+               "Local: Research priority", "Local: Watch priority",
+               "Global: Highest priority", "Global: Near priority",
+               "Global: Research priority", "Global: Watch priority")) +
+  guides(fill = guide_legend(ncol = 2)) +
+  geom_text(data = total_species_per_order, aes(x = 1.5, y = 102, label = total_species),
+            inherit.aes = FALSE, size = 5, fontface = "bold", vjust = -0.5) +
+  theme_minimal() +
+  theme(axis.text.x = element_blank(), axis.title.x = element_blank(),
+        axis.text.y = element_text(size = 14, margin = margin(r = 10)),
+        axis.title.y = element_text(size = 16, margin = margin(r = 20)),
+        panel.grid = element_blank(), legend.position = "bottom", legend.title = element_blank()) +
+  facet_grid(~ mammal_order)
+
+priority_order_distribution
+
+save_figure(priority_order_distribution, "Fig4d_priority_categories_by_order", width = 10, height = 7)
+
+rm(EDGE2_species_order, total_species_per_order, order_order, colors_global, colors_brz,
+   priority_order_distribution)
+
+```
+
+**Composition of each priority list by order:**
+
+```{r, fig.width=14, fig.height=7}
+
+# 1. Percentage of species in each list belonging to each order
+
+EDGE2_list_summary <- species_lists_long %>%
+  mutate(region = factor(region, levels = c("brz", "global"), labels = c("Local", "Global"))) %>%
+  group_by(region, order, list) %>%
+  summarise(count = n(), .groups = "drop") %>%
+  group_by(region, list) %>%
+  mutate(proportion    = count / sum(count),
+         cumulative    = cumsum(proportion) - (proportion / 2),
+         total_species = sum(count)) %>%
+  ungroup()
+
+# 2. Plot
+
+priority_species_per_list_order <- ggplot(EDGE2_list_summary, aes(x = list, y = count, fill = order)) +
+  geom_bar(stat = "identity", position = position_fill(reverse = TRUE), alpha = 0.75) +
+  geom_text(aes(y = cumulative, label = ifelse(proportion >= 0.05, scales::percent(proportion, accuracy = 1), "")),
+            color = "black", size = 5) +
+  geom_text(data = distinct(EDGE2_list_summary, list, region, total_species),
+            aes(y = 1.05, x = list, label = total_species),
+            color = "black", size = 6, fontface = "bold", inherit.aes = FALSE) +
+  coord_flip() +
+  scale_fill_scico_d(palette = "batlow") +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  labs(y = "Percentage of total species in list belonging to order") +
+  theme_minimal() +
+  theme(axis.title.y = element_blank(), legend.position = "none",
+        axis.text.y = element_text(size = 16, face = "bold", color = "black"),
+        axis.text.x = element_text(size = 14, color = "black"),
+        panel.grid = element_blank(),
+        axis.title.x = element_text(size = 16, color = "black", margin = margin(t = 20))) +
+  facet_grid(~ region)
+
+priority_species_per_list_order
+
+save_figure(priority_species_per_list_order, "Fig4e_priority_list_composition_by_order", width = 14, height = 7)
+
+rm(EDGE2_list_summary, priority_species_per_list_order, species_lists_long)
+
+```
+
+**Highest-priority species on the phylogeny:**
+
+```{r, fig.width=15, fig.height=15}
+
+# 1. First tree, pruned to the Brazilian species
+
+plot_tree <- ape::drop.tip(phylacine_tree_grafted[[1]],
+                           setdiff(phylacine_tree_grafted[[1]]$tip.label, unique(EDGE2_species$binomial)))
+
+# 2. Graft status of each species
+
+graft_status <- phylacine_tree_grafted[[1]]$graft_status %>%
+  mutate(id = gsub("_", " ", species)) %>%
+  filter(id %in% brz_mam_taxonomy$binomial) %>%
+  mutate(graft = case_when(status == "grafted at genus level"  ~ "genus",
+                           status == "grafted at family level" ~ "family",
+                           TRUE                                ~ "none")) %>%
+  select(id, graft)
+
+# 3. Probability of omission and highest-priority perspective of each species
+
+EDGE2_species_tree <- EDGE2_species %>%
+  transmute(id = binomial,
+            median_exclusion_prob_global,
+            type = case_when(BREDGE_list_global & BREDGE_list_brz ~ "both",
+                             BREDGE_list_global                   ~ "global",
+                             BREDGE_list_brz                      ~ "brz",
+                             TRUE                                 ~ NA_character_))
+
+# 4. Orders, with the node to highlight and a silhouette
+
+orders_nodes <- brz_mam_taxonomy %>%
+  select(binomial, order) %>%
+  group_by(order) %>%
+  summarise(mrca_node = if (n() > 1) ape::getMRCA(plot_tree, binomial) else which(plot_tree$tip.label == binomial),
+            .groups = "drop")
+
+phylopics <- data.frame(
+  order = c("Artiodactyla", "Carnivora", "Chiroptera", "Cingulata", "Didelphimorphia",
+            "Lagomorpha", "Perissodactyla", "Pilosa", "Primates", "Rodentia", "Sirenia"),
+  image = c("f36c9daa-a102-42dd-88ac-a126753943d2", "9b6dc5fd-eeb9-4760-99e4-fca70ec74db0",
+            "21180755-3394-40bf-93eb-810954c0f7ba", "5d59b5ce-c1dd-40f6-b295-8d2629b9775e",
+            "0e1fe113-feb7-46db-8a10-12f22f80332c", "031b0020-2389-473b-8b71-d855ec2c06d5",
+            "4fcdd729-6eb6-42b8-be67-303077fa6d19", "925fa570-10d9-4319-bd8a-e64ad7987900",
+            "cbfc863c-9ca3-441e-9e38-95876fe19203", "9c234021-ce53-45d9-8fdd-b0ca3115a451",
+            "12597d6c-9c80-4510-9826-975eabddc597")
+)
+
+orders_nodes <- merge(orders_nodes, phylopics, by = "order")
+
+# 5. Plot
+
+tree_plot_1 <- ggtree(plot_tree, layout = "circular") +
+  geom_hilight(data = orders_nodes, mapping = aes(node = mrca_node, fill = order), alpha = .5) +
+  scale_fill_scico_d(palette = "batlow") +
+  new_scale_fill()
+
+tree_plot_2 <- tree_plot_1 +
+  geom_fruit(data = graft_status, geom = geom_tile, mapping = aes(y = id, fill = factor(graft)),
+             width = 8, offset = 0.03, color = "lightgrey") +
+  scale_fill_manual(name = "Graft status",
+                    values = c("family" = "grey25", "genus" = "grey75", "none" = "white"),
+                    guide = guide_legend(keywidth = 0.5, keyheight = 0.5, order = 3)) +
+  new_scale_fill()
+
+tree_plot_3 <- tree_plot_2 +
+  geom_fruit(data = EDGE2_species_tree, geom = geom_tile,
+             mapping = aes(y = id, fill = median_exclusion_prob_global),
+             width = 8, offset = 0.03, color = NA) +
+  scale_fill_scico(palette = "vik", midpoint = 0.5, name = "Probability of omission") +
+  new_scale_fill()
+
+tree_plot_4 <- tree_plot_3 +
+  geom_fruit(data = EDGE2_species_tree[!is.na(EDGE2_species_tree$type), ],
+             geom = geom_star, mapping = aes(y = id, fill = type),
+             starshape = 15, size = 2, offset = 0.06, pwidth = 0.1, inherit.aes = FALSE,
+             grid.params = list(linetype = 3, size = 0.2)) +
+  scale_fill_manual(name = "Highest priority list",
+                    values = c("brz" = "#6da779", "global" = "#8fa0e3", "both" = "black"),
+                    breaks = c("global", "brz", "both"),
+                    labels = c("Global", "Local", "Both"))
+
+tree_plot_4
+
+save_figure(tree_plot_4, "Fig4a_priority_species_tree", width = 15, height = 15)
+
+rm(plot_tree, graft_status, EDGE2_species_tree, orders_nodes, phylopics,
+   tree_plot_1, tree_plot_2, tree_plot_3, tree_plot_4)
+
+```
+
+**What drives the priority species: score components per category and order (Figs S51 and S52):**
+
+To show why species end up on the priority lists, we decompose the score of each priority species into its three components. Because the score is a product (BPS = ED₂ × extinction probability × PO), its logarithm is the sum of the logarithms of the components. For each priority species, we express each component relative to its median across all species (log₁₀), so that the three contributions add up to how far the species' score lies above that of a typical species. For each group, the bars show the mean value of each component across its priority species, relative to a typical species. Only priority species are included (per perspective), so the plots show what drives the species on the lists, not the average species of a group. The three components are shown side by side: first for each priority class (conservation, research, watch) as an overview, then for taxonomic groups and biomes, in one panel per priority class and perspective, so that groups can be compared within the same class.
+
+```{r, fig.width=12, fig.height=8}
+
+# 1. Contribution of each component to each species' score, relative to the
+#    median of that component across all species (log10), per perspective
+
+score_contributions <- EDGE2_species %>%
+  transmute(binomial,
+            ED2_global  = median_ED_global,   Pext_global = median_pext_global, PO_global = median_exclusion_prob_global,
+            ED2_local   = median_ED_brz,      Pext_local  = median_pext_brz,    PO_local  = median_exclusion_prob_brz) %>%
+  pivot_longer(-binomial, names_to = c("component", "perspective"), names_sep = "_", values_to = "value") %>%
+  group_by(component, perspective) %>%
+  mutate(contribution = log10(value / median(value))) %>%
+  ungroup() %>%
+  select(-value)
+
+# 2. Keep priority species only, with their category and order (per perspective)
+
+priority_contributions <- score_contributions %>%
+  inner_join(priority_long %>% select(binomial, perspective, category, group, order),
+             by = c("binomial", "perspective")) %>%
+  rename(priority_class = group) %>%
+  mutate(component   = factor(component, levels = c("ED2", "Pext", "PO"),
+                              labels = c("ED2", "Extinction probability", "PO")),
+         perspective = factor(perspective, levels = c("global", "local"), labels = c("Global", "Local")))
+
+# 3. Per taxonomic group within each priority class and perspective: one panel
+#    per class and perspective, with the three components side by side, so
+#    that groups can be compared within the same class
+
+plot_driver_panels <- function(data, group_var, group_order) {
+  
+  class_labels <- c(conservation = "Conservation priority (Highest + Near)",
+                    research     = "Research priority",
+                    watch        = "Watch priority")
+  
+  profile <- data %>%
+    group_by(priority_class, perspective, group = .data[[group_var]], component) %>%
+    summarise(contribution = mean(contribution), n_species = n_distinct(binomial), .groups = "drop") %>%
+    filter(group %in% group_order) %>%
+    mutate(panel = factor(paste0(class_labels[priority_class], " \u2013 ", perspective),
+                          levels = paste0(rep(class_labels, each = 2), " \u2013 ", c("Global", "Local"))),
+           # Group label with its number of priority species in this panel
+           label = paste0(group, " (n = ", n_species, ")"),
+           group_rank = match(group, group_order)) %>%
+    arrange(group_rank)
+  
+  profile$label <- factor(profile$label, levels = rev(unique(profile$label)))
+  
+  multiples <- c(0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50, 100)
+  
+  ggplot(profile, aes(x = contribution, y = label, fill = component)) +
+    geom_vline(xintercept = 0, linewidth = 0.4, color = "grey30") +
+    geom_col(position = position_dodge2(reverse = TRUE, padding = 0.1), width = 0.8) +
+    scale_fill_manual(values = c("ED2" = "#5b8e7d", "Extinction probability" = "#bc4b51", "PO" = "#f4a259"),
+                      name = NULL) +
+    scale_x_continuous(breaks = log10(multiples), labels = paste0("\u00d7", multiples)) +
+    labs(x = "Component value relative to a typical species", y = NULL) +
+    facet_wrap(~ panel, ncol = 2, scales = "free_y") +
+    theme_minimal() +
+    theme(panel.grid.minor = element_blank(),
+          panel.grid.major.y = element_blank(),
+          panel.border = element_rect(fill = NA, color = "black", linewidth = 0.5),
+          strip.text = element_text(face = "bold", size = 10),
+          axis.text = element_text(size = 9, color = "black"),
+          legend.position = "bottom")
+}
+
+# 4. Overview per priority class and perspective (all priority species in the
+#    class), with the same layout
+
+driver_category_plot <- priority_contributions %>%
+  group_by(priority_class, perspective, component) %>%
+  summarise(contribution = mean(contribution), n_species = n_distinct(binomial), .groups = "drop") %>%
+  mutate(class = factor(priority_class, levels = c("conservation", "research", "watch"),
+                        labels = c("Conservation", "Research", "Watch")),
+         label = factor(paste0(class, " (n = ", n_species, ")"))) %>%
+  ggplot(aes(x = contribution, y = reorder(label, -as.numeric(class)), fill = component)) +
+  geom_vline(xintercept = 0, linewidth = 0.4, color = "grey30") +
+  geom_col(position = position_dodge2(reverse = TRUE, padding = 0.1), width = 0.8) +
+  scale_fill_manual(values = c("ED2" = "#5b8e7d", "Extinction probability" = "#bc4b51", "PO" = "#f4a259"),
+                    name = NULL) +
+  scale_x_continuous(breaks = log10(c(0.5, 1, 2, 5, 10, 20)),
+                     labels = paste0("\u00d7", c(0.5, 1, 2, 5, 10, 20))) +
+  labs(x = "Component value relative to a typical species", y = NULL) +
+  facet_wrap(~ perspective, scales = "free_y") +
+  theme_minimal() +
+  theme(panel.grid.minor = element_blank(),
+        panel.grid.major.y = element_blank(),
+        panel.border = element_rect(fill = NA, color = "black", linewidth = 0.5),
+        strip.text = element_text(face = "bold", size = 11),
+        axis.text = element_text(size = 10, color = "black"),
+        legend.position = "bottom")
+
+driver_category_plot
+
+save_figure(driver_category_plot, "FigS51_score_drivers_by_category", width = 11, height = 4.5, type = "supplementary")
+
+# 5. Per order
+
+orders_by_priority <- priority_species_flags %>%
+  filter(priority_any) %>%
+  count(order, sort = TRUE) %>%
+  pull(order)
+
+driver_order_plot <- plot_driver_panels(priority_contributions, "order", orders_by_priority)
+
+driver_order_plot
+
+save_figure(driver_order_plot, "FigS52_score_drivers_by_order", width = 11, height = 11, type = "supplementary")
+
+rm(driver_category_plot, orders_by_priority, driver_order_plot)
+
+```
+
+# 4. Spatial distribution of barcoding priorities
+
+We overlay a 25 × 25 km grid across Brazil and intersect it with the species range maps. For each grid cell, we calculate the total species richness and the richness of priority species per category and perspective, overall and per order.
+
+## 4.1. Data preparation
+
+**Context layers for the maps:**
+
+The rivers and cities are downloaded from Natural Earth, and the biome borders (IBGE 2019) with geobr. Both are cached in `output/cache/`.
+
+```{r}
+
+# 1. Brazil boundary, in WGS84 and in a planar projection for the grid
+
+brazil      <- ne_countries(country = "Brazil", scale = "medium", returnclass = "sf")
+brazil      <- st_transform(brazil, 4326)
+brazil_proj <- st_transform(brazil, 3857)
+
+# 2. Major rivers and cities (Natural Earth, cached)
+
+if (needs_build("natural_earth_layers.rds")) {
+  
+  rivers <- ne_download(scale = 10, type = "rivers_lake_centerlines", category = "physical", returnclass = "sf")
+  major_rivers <- st_intersection(st_transform(rivers, 4326), brazil) %>%
+    filter(scalerank <= 6)
+  
+  cities <- ne_download(scale = 10, type = "populated_places", category = "cultural", returnclass = "sf")
+  cities_brazil <- cities %>%
+    filter(SOV0NAME == "Brazil" & NAME %in% c("São Paulo", "Rio de Janeiro", "Brasília", "Manaus", "Belém",
+                                               "Fortaleza", "Salvador", "Belo Horizonte", "Curitiba",
+                                               "Recife", "Goiânia", "Porto Alegre"))
+  
+  saveRDS(list(major_rivers = major_rivers, cities_brazil = cities_brazil), cache_file("natural_earth_layers.rds"))
+  
+  rm(rivers, cities, major_rivers, cities_brazil)
+}
+
+list2env(readRDS(cache_file("natural_earth_layers.rds")), envir = environment())
+
+# 3. Biome borders (IBGE 2019, via geobr; downloaded once and cached),
+#    simplified for plotting
+
+if (needs_build("biomes.rds")) {
+  saveRDS(geobr::read_biomes(year = 2019, simplified = FALSE, showProgress = FALSE),
+          cache_file("biomes.rds"))
+}
+
+biome_names <- c("Amazonia"       = "Amazon",
+                 "Mata Atlantica" = "Atlantic Forest",
+                 "Caatinga"       = "Caatinga",
+                 "Cerrado"        = "Cerrado",
+                 "Pampa"          = "Pampa",
+                 "Pantanal"       = "Pantanal")
+
+biomes_ibge <- readRDS(cache_file("biomes.rds")) %>%
+  mutate(name_ascii = iconv(name_biome, to = "ASCII//TRANSLIT")) %>%
+  filter(name_ascii %in% names(biome_names)) %>%
+  mutate(biome = unname(biome_names[name_ascii]))
+
+biomes <- lapply(split(biomes_ibge, biomes_ibge$biome), function(shp) {
+  shp <- st_make_valid(shp)
+  shp <- st_simplify(st_transform(shp, 5880), preserveTopology = FALSE, dTolerance = 1000)
+  st_transform(st_make_valid(shp), 4326)
+})
+
+rm(biome_names, biomes_ibge)
+
+# 4. Plotting extent
+
+brazil_bbox <- st_bbox(brazil)
+x_pad <- diff(c(brazil_bbox["xmin"], brazil_bbox["xmax"])) * 0.05
+y_pad <- diff(c(brazil_bbox["ymin"], brazil_bbox["ymax"])) * 0.05
+
+
+```
+
+**Range maps of Brazilian species:**
+
+We read the range maps of Brazilian species from the files downloaded in Part 1. Species maps are matched to Brazilian species through the synonym list. The processed ranges are cached.
+
+```{r}
+
+if (needs_build("brazilian_range_polygons.rds")) {
+  
+  # 1. Map names (accepted names and synonyms) to accepted names
+  
+  syn_map <- unlist(lapply(names(brz_mam_synonyms), function(x) {
+    setNames(rep(x, length(brz_mam_synonyms[[x]])), brz_mam_synonyms[[x]])
+  }))
+  
+  # 2. Read only the polygons of the named species from a GeoPackage
+  
+  read_ranges <- function(gpkg_path, names_to_keep) {
+    layer <- st_layers(gpkg_path)$name[1]
+    name_list <- paste0("'", gsub("'", "''", names_to_keep, fixed = TRUE), "'", collapse = ", ")
+    st_read(gpkg_path, quiet = TRUE,
+            query = paste0('SELECT * FROM "', layer, '" WHERE sciname IN (', name_list, ')'))
+  }
+  
+  range_polygons <- do.call(rbind, lapply(here(range_map_files), function(f) {
+    polygons <- read_ranges(f, names(syn_map))
+    polygons$binomial <- unname(syn_map[polygons$sciname])
+    polygons[, c("sciname", "binomial")]
+  }))
+  
+  range_polygons <- st_make_valid(range_polygons)
+  
+  # 3. Merge the ranges of map species that correspond to one Brazilian species
+  
+  shared <- range_polygons$binomial %in% range_polygons$binomial[duplicated(range_polygons$binomial)]
+  
+  merged <- range_polygons[shared, ] %>%
+    group_by(binomial) %>%
+    summarise(sciname = paste(sort(unique(sciname)), collapse = "; "), .groups = "drop")
+  
+  range_polygons <- rbind(range_polygons[!shared, c("sciname", "binomial")],
+                          merged[, c("sciname", "binomial")])
+  
+  # 4. Project to the grid projection and simplify
+  
+  range_polygons <- range_polygons %>%
+    st_transform(3857) %>%
+    st_simplify(dTolerance = 500)
+  
+  saveRDS(range_polygons, cache_file("brazilian_range_polygons.rds"))
+  
+  rm(syn_map, read_ranges, shared, merged, range_polygons)
+}
+
+range_polygons <- readRDS(cache_file("brazilian_range_polygons.rds"))
+
+message(length(unique(range_polygons$binomial)), " of ", nrow(brz_mam_taxonomy), " species have a range map")
+
+```
+
+**Check: merged ranges of species that do not occur in Brazil:**
+
+Some map species that are treated as synonyms of Brazilian species do not occur in Brazil themselves (e.g. several *Cebus* species recently split from *C. albifrons*, and *Lycalopex griseus*). Their ranges are merged with those of the Brazilian species. Since the grid only covers Brazil, this only affects the results if their ranges extend into Brazil. We check this here.
+
+```{r}
+
+non_brazilian <- c("Cebus aequatorialis", "Cebus cesarae", "Cebus cuscinus", "Cebus leucocephalus",
+                   "Cebus malitiosus", "Cebus versicolor", "Cebus yuracus", "Cebus brunneus",
+                   "Lycalopex griseus")
+
+non_brazilian_ranges <- do.call(rbind, lapply(here(range_map_files), function(f) {
+  layer <- st_layers(f)$name[1]
+  st_read(f, quiet = TRUE,
+          query = paste0('SELECT * FROM "', layer, '" WHERE sciname IN (',
+                         paste0("'", non_brazilian, "'", collapse = ", "), ')'))[, "sciname"]
+}))
+
+overlap_with_brazil <- non_brazilian_ranges %>%
+  st_make_valid() %>%
+  st_transform(3857) %>%
+  st_intersection(brazil_proj[, "geometry"]) %>%
+  mutate(area_in_brazil_km2 = as.numeric(st_area(.)) / 1e6) %>%
+  st_drop_geometry() %>%
+  group_by(sciname) %>%
+  summarise(area_in_brazil_km2 = sum(area_in_brazil_km2), .groups = "drop")
+
+overlap_with_brazil
+
+rm(non_brazilian, non_brazilian_ranges)
+
+```
+
+**Grid and species per grid cell:**
+
+```{r}
+
+# 1. 25 km grid over Brazil
+
+resolution_m <- 25000
+
+grid_sf_proj <- st_sf(geometry = st_make_grid(brazil_proj, cellsize = resolution_m, square = TRUE))
+grid_sf_proj <- grid_sf_proj[st_intersects(grid_sf_proj, brazil_proj, sparse = FALSE), ]
+
+# 2. Species attributes, in the order of the range polygons
+
+range_species <- range_polygons %>%
+  st_drop_geometry() %>%
+  select(binomial) %>%
+  left_join(EDGE2_species, by = "binomial") %>%
+  left_join(priority_species_flags %>% select(binomial, order, global_category, local_category, priority_any),
+            by = "binomial")
+
+# 3. Species present in each grid cell
+
+intersections <- st_intersects(grid_sf_proj, range_polygons, sparse = TRUE)
+
+```
+
+## 4.2. Spatial metrics per grid cell
+
+```{r}
+
+# 1. Summary of a species attribute per grid cell
+
+cell_summary <- function(values, fun) {
+  out <- sapply(intersections, function(i) if (length(i) > 0) fun(values[i], na.rm = TRUE) else NA)
+  out[is.nan(out)] <- NA
+  out
+}
+
+count_species <- function(flag) cell_summary(as.numeric(flag), sum)
+
+# 2. Total species richness
+
+grid_sf_proj$richness <- sapply(intersections, function(i) length(unique(range_species$binomial[i])))
+
+# 4. Richness of priority species per category group and perspective (each
+#    species counted once per map)
+
+category_groups <- list(conservation = c("Highest priority", "Near priority"),
+                        research     = "Research priority",
+                        watch        = "Watch priority")
+
+for (persp in c("global", "local")) {
+  for (g in names(category_groups)) {
+    grid_sf_proj[[paste0("priority_", g, "_", persp)]] <-
+      count_species(range_species[[paste0(persp, "_category")]] %in% category_groups[[g]])
+  }
+}
+
+# 5. Richness of species that are a priority from either perspective, in any
+#    category (each species counted once)
+
+grid_sf_proj$priority_any <- count_species(range_species$priority_any)
+
+# 6. Richness of priority species per order (either perspective, any category),
+#    for orders with at least min_priority_species priority species
+
+min_priority_species <- 5
+
+priority_orders <- priority_species_flags %>%
+  filter(priority_any) %>%
+  count(order, sort = TRUE) %>%
+  filter(n >= min_priority_species) %>%
+  pull(order)
+
+for (ord in priority_orders) {
+  grid_sf_proj[[paste0("priority_", ord)]] <- count_species(range_species$priority_any & range_species$order == ord)
+}
+
+# 7. Richness of threatened species (IUCN), for the regional summary below
+
+grid_sf_proj$threatened <- count_species(range_species$iucn_status %in% c("VU", "EN", "CR"))
+
+rm(persp, g, ord)
+
+```
+
+## 4.3. Maps
+
+```{r}
+
+# 1. Convert one grid metric to a raster for plotting (WGS84)
+
+grid_vect <- terra::vect(grid_sf_proj)
+r_template <- terra::rast(terra::ext(grid_vect), resolution = resolution_m, crs = terra::crs(grid_vect))
+
+to_stars <- function(field) {
+  r <- terra::rasterize(grid_vect, r_template, field = field)
+  st_as_stars(terra::project(r, "EPSG:4326"))
+}
+
+# 2. Map of Brazil with a diverging scale centred on the median (metrics)
+#    or a sequential scale (priority richness)
+
+plot_brazil_map <- function(field, legend_title, scale_type = c("diverging", "priority"),
+                            title = NULL, label = NULL, limits = NULL) {
+  
+  scale_type <- match.arg(scale_type)
+  values <- grid_sf_proj[[field]]
+  
+  fill_scale <- if (scale_type == "diverging") {
+    scale_fill_scico(palette = "vik", midpoint = median(values, na.rm = TRUE), direction = 1,
+                     na.value = "white",
+                     limits = quantile(values, c(0.01, 0.99), na.rm = TRUE),
+                     breaks = scales::pretty_breaks(n = 3), oob = scales::squish, name = legend_title)
+  } else {
+    scale_fill_scico(palette = "lipari", na.value = "white", breaks = scales::pretty_breaks(n = 3),
+                     name = legend_title, limits = limits,
+                     trans = scales::trans_new("square", transform = function(x) x^2,
+                                               inverse = function(x) sqrt(x)))
+  }
+  
+  p <- ggplot() +
+    geom_stars(data = to_stars(field)) +
+    geom_sf(data = major_rivers, color = "white", linewidth = 0.6, alpha = 0.5) +
+    fill_scale +
+    lapply(biomes, function(b) geom_sf(data = b, fill = NA, color = "black", linewidth = 0.1)) +
+    geom_sf(data = brazil, fill = NA, color = "black", linewidth = 0.6) +
+    geom_sf(data = cities_brazil, color = "black", size = 2, shape = 21, fill = "white", stroke = 1) +
+    coord_sf(xlim = c(brazil_bbox["xmin"] - x_pad, brazil_bbox["xmax"] + x_pad),
+             ylim = c(brazil_bbox["ymin"] - y_pad, brazil_bbox["ymax"] + y_pad),
+             expand = FALSE) +
+    guides(fill = guide_colorbar(direction = "horizontal", title.position = "top", title.hjust = 0.5,
+                                 barwidth = unit(1, "in"), barheight = unit(0.15, "in"))) +
+    annotation_scale(location = "br", width_hint = 0.2) +
+    annotation_north_arrow(location = "tr", which_north = "true", style = north_arrow_fancy_orienteering) +
+    theme_minimal() +
+    theme(plot.title = element_text(hjust = 0.5, face = "bold"),
+          panel.grid = element_blank(),
+          panel.border = element_rect(fill = NA, color = "black"),
+          axis.title = element_blank(),
+          axis.text = element_text(size = 12, color = "black"),
+          axis.ticks = element_line(color = "black", linewidth = 0.5),
+          legend.position = c(0.02, 0.02),
+          legend.justification = c("left", "bottom"),
+          legend.direction = "horizontal")
+  
+  if (!is.null(title)) p <- p + ggtitle(title)
+  
+  if (!is.null(label)) {
+    p <- p + annotate("text", x = brazil_bbox["xmax"] + x_pad * 0.8, y = brazil_bbox["ymin"] + y_pad * 1.2,
+                      label = label, hjust = 1, vjust = 0, size = 3.5)
+  }
+  
+  p
+}
+
+```
+
+**Figure 5a: total species richness:**
+
+```{r, fig.width=5, fig.height=5}
+
+richness_plot <- plot_brazil_map("richness", "Total richness", "diverging")
+
+richness_plot
+
+save_figure(richness_plot, "Fig5a_species_richness", width = 5, height = 5)
+
+rm(richness_plot)
+
+```
+
+**Figures 5b and 5c: richness of priority species per category, from the global (5b) and local (5c) perspective:**
+
+One map per category group (rows) and perspective (columns). The global and local maps of each category share the same colour scale, so that they can be compared directly. The label on each map gives the number of priority species in that category and perspective that lack a range map, and are therefore missing from the map.
+
+```{r, fig.width=10, fig.height=15}
+
+priority_maps <- list()
+
+for (g in names(category_groups)) {
+  
+  # Shared colour scale for the global and local maps of this category
+  fields <- paste0("priority_", g, "_", c("global", "local"))
+  limits <- range(unlist(st_drop_geometry(grid_sf_proj)[fields]), na.rm = TRUE)
+  
+  for (persp in c("global", "local")) {
+    missing <- missing_range_maps %>% filter(perspective == persp, group == g)
+    p <- plot_brazil_map(paste0("priority_", g, "_", persp), "Priority richness", "priority",
+                         limits = limits,
+                         label = paste0("# missing: ", missing$n_without_map, "/", missing$n_species))
+    panel <- c(global = "Fig5b", local = "Fig5c")[[persp]]
+    save_figure(p, paste0(panel, "_priority_richness_", g, "_", persp), width = 5, height = 5)
+    priority_maps[[paste(g, persp)]] <- p + ggtitle(paste(toupper(g), "-", toupper(persp)))
+  }
+}
+
+wrap_plots(priority_maps, ncol = 2)
+
+rm(priority_maps, fields, limits, g, persp, missing, p, panel)
+
+```
+
+**Figure 5d: richness of priority species overall and per order:**
+
+The first map shows all species that are a priority from either perspective, in any category, each counted once. The other maps show the same per order, for orders with at least `r min_priority_species` priority species.
+
+```{r, fig.width=18, fig.height=5}
+
+missing_any <- missing_range_maps %>% filter(group == "any")
+
+all_priorities_map <- plot_brazil_map("priority_any", "Priority richness", "priority", title = "ALL PRIORITIES",
+                                      label = paste0("# missing: ", missing_any$n_without_map, "/", missing_any$n_species))
+
+save_figure(all_priorities_map, "Fig5d_priority_richness_all", width = 5, height = 5)
+
+order_maps <- lapply(priority_orders, function(ord) {
+  p <- plot_brazil_map(paste0("priority_", ord), "Priority richness", "priority", title = toupper(ord))
+  save_figure(p, paste0("Fig5d_priority_richness_", ord), width = 5, height = 5)
+  p
+})
+
+wrap_plots(c(list(all_priorities_map), order_maps), nrow = 1)
+
+rm(missing_any, all_priorities_map, order_maps)
+
+```
+
+**Statistics reported in the main text: priorities per region:**
+
+Mean richness of priority species per grid cell in each biome, compared with the richness of threatened species. The Amazon is also split into its western and eastern parts (at 60°W).
+
+```{r}
+
+# 1. Biome of each grid cell (based on the cell centre)
+
+biome_sf <- do.call(rbind, lapply(names(biomes), function(b) {
+  st_sf(biome = b, geometry = st_union(st_geometry(biomes[[b]])))
+})) %>%
+  st_transform(3857)
+
+cell_centres <- st_centroid(st_geometry(grid_sf_proj))
+
+grid_sf_proj$biome <- biome_sf$biome[sapply(st_intersects(cell_centres, biome_sf),
+                                             function(i) if (length(i) > 0) i[1] else NA)]
+
+grid_sf_proj$longitude <- st_coordinates(st_transform(cell_centres, 4326))[, 1]
+
+grid_sf_proj$region <- ifelse(grid_sf_proj$biome == "Amazon",
+                              ifelse(grid_sf_proj$longitude < -60, "Western Amazon", "Eastern Amazon"),
+                              grid_sf_proj$biome)
+
+# 2. Mean and maximum priority richness per region, per category group and
+#    perspective (each species counted once per map)
+
+priority_fields <- c("priority_any",
+                     paste0("priority_", rep(names(category_groups), each = 2), "_", c("global", "local")))
+
+priorities_by_region <- grid_sf_proj %>%
+  st_drop_geometry() %>%
+  filter(!is.na(region)) %>%
+  group_by(region) %>%
+  summarise(n_cells    = n(),
+            richness   = mean(richness),
+            threatened = mean(threatened, na.rm = TRUE),
+            across(all_of(priority_fields), ~ mean(.x, na.rm = TRUE)),
+            .groups = "drop") %>%
+  arrange(region)
+
+priorities_by_region
+
+save_table(priorities_by_region, "priorities_by_region", type = "additional")
+
+priority_peaks_by_region <- grid_sf_proj %>%
+  st_drop_geometry() %>%
+  filter(!is.na(region)) %>%
+  group_by(region) %>%
+  summarise(across(all_of(priority_fields), ~ max(.x, na.rm = TRUE)), .groups = "drop") %>%
+  arrange(region)
+
+priority_peaks_by_region
+
+rm(biome_sf, cell_centres)
+
+```
+
+**Statistics reported in the main text: priority species and maps:**
+
+```{r}
+
+# 1. Priority species per order: from either perspective (each species once),
+#    and per category group and perspective
+
+priority_by_order <- priority_species_flags %>%
+  group_by(order) %>%
+  summarise(n_species = n(), any_priority = sum(priority_any), .groups = "drop") %>%
+  left_join(priority_long %>%
+              mutate(column = paste0(group, "_", perspective)) %>%
+              count(order, column) %>%
+              pivot_wider(names_from = column, values_from = n, values_fill = 0),
+            by = "order") %>%
+  mutate(across(-c(order, n_species), ~ replace_na(.x, 0L))) %>%
+  mutate(across(-c(order, n_species), ~ .x / n_species * 100, .names = "percent_{.col}")) %>%
+  arrange(desc(any_priority))
+
+priority_by_order
+
+# 2. Composition of each category group by order, per perspective
+#    (n and % of the category)
+
+category_composition <- priority_long %>%
+  count(perspective, group, order, name = "n") %>%
+  group_by(perspective, group) %>%
+  mutate(percent_of_category = n / sum(n) * 100) %>%
+  arrange(perspective, group, desc(n)) %>%
+  ungroup()
+
+print(category_composition, n = Inf)
+
+# 3. Number of unique species among the top 10 of each highest-priority list (Fig. 4B)
+
+top10_global <- EDGE2_species %>% filter(BREDGE_list_global) %>% slice_max(median_BREDGE_global, n = 10)
+top10_local  <- EDGE2_species %>% filter(BREDGE_list_brz) %>% slice_max(median_BREDGE_brz, n = 10)
+
+length(union(top10_global$binomial, top10_local$binomial))
+
+# 4. Values of example species mentioned in the text
+
+EDGE2_species %>%
+  filter(binomial %in% c("Trichechus inunguis", "Plecturocebus vieirai", "Cyclopes rufus")) %>%
+  select(binomial, iucn_status, salve_status,
+         median_BREDGE_global, median_BREDGE_brz,
+         median_ED_global, median_ED_brz,
+         median_pext_global, median_pext_brz)
+
+# 5. Species without a range map per category and perspective (Limitations):
+#    see missing_range_maps above
+
+missing_range_maps
+
+# 6. Maximum priority richness per grid cell, and the region where it occurs
+
+grid_sf_proj %>%
+  st_drop_geometry() %>%
+  select(region, all_of(priority_fields)) %>%
+  pivot_longer(-region, names_to = "map", values_to = "richness") %>%
+  group_by(map) %>%
+  slice_max(richness, n = 1, with_ties = FALSE) %>%
+  ungroup()
+
+# 7. Watch priority species: median ED2 and PO, compared with all species
+
+EDGE2_species %>%
+  left_join(priority_species_flags %>% select(binomial, global_category, local_category), by = "binomial") %>%
+  summarise(
+    ED_watch_global = median(median_ED_global[global_category == "Watch priority"]),
+    ED_all_global   = median(median_ED_global),
+    ED_watch_local  = median(median_ED_brz[local_category == "Watch priority"]),
+    ED_all_local    = median(median_ED_brz),
+    PO_watch_global = median(median_exclusion_prob_global[global_category == "Watch priority"]),
+    PO_watch_local  = median(median_exclusion_prob_global[local_category == "Watch priority"]),
+    PO_all          = median(median_exclusion_prob_global)
+  )
+
+# Global research priorities that are local watch priorities
+
+sum(priority_species_flags$global_category == "Research priority" &
+      priority_species_flags$local_category  == "Watch priority")
+
+# 8. Species occurring in each region (each species once per region), with
+#    the number of grid cells it occupies there
+
+species_region <- tibble(cell = rep(seq_along(intersections), lengths(intersections)),
+                         idx  = unlist(intersections)) %>%
+  mutate(binomial = range_species$binomial[idx],
+         region   = grid_sf_proj$region[cell]) %>%
+  filter(!is.na(region)) %>%
+  count(region, binomial, name = "n_cells_in_region")
+
+# 9. Traits and scores of the globally threatened species (IUCN) in each region
+
+threatened_by_region <- species_region %>%
+  left_join(EDGE2_species %>% select(binomial, iucn_status, salve_status, median_ED_global,
+                                     median_exclusion_prob_global), by = "binomial") %>%
+  left_join(brz_mam_metadata %>% select(binomial, BodyMass_g, RangeSize), by = "binomial") %>%
+  left_join(priority_species_flags %>% select(binomial, order, global_category, local_category),
+            by = "binomial") %>%
+  filter(iucn_status %in% c("VU", "EN", "CR")) %>%
+  group_by(region) %>%
+  summarise(n_threatened_species    = n(),
+            median_cells_in_region  = median(n_cells_in_region),
+            median_range_size       = median(RangeSize, na.rm = TRUE),
+            median_body_mass_g      = median(BodyMass_g, na.rm = TRUE),
+            median_PO               = median(median_exclusion_prob_global),
+            median_ED2_global       = median(median_ED_global),
+            percent_conservation_priority_global =
+              mean(global_category %in% c("Highest priority", "Near priority")) * 100,
+            percent_primates        = mean(order == "Primates") * 100,
+            percent_rodents         = mean(order == "Rodentia") * 100,
+            .groups = "drop") %>%
+  arrange(desc(n_threatened_species))
+
+print(threatened_by_region, width = Inf)
+
+save_table(threatened_by_region, "threatened_species_by_region", type = "additional")
+
+# 10. Local categories and SALVE status of the global research priorities
+#     occurring in western Amazonia
+
+species_region %>%
+  filter(region == "Western Amazon") %>%
+  left_join(priority_species_flags, by = "binomial") %>%
+  left_join(EDGE2_species %>% select(binomial, salve_status), by = "binomial") %>%
+  filter(global_category == "Research priority") %>%
+  count(local_category, salve_status)
+
+rm(top10_global, top10_local)
+
+```
+
+**What drives the priority species: score components per biome (Fig. S53):**
+
+As for the orders, for the priority species occurring in each biome (each species once per biome and perspective). The Amazon is shown as one biome here.
+
+```{r, fig.width=11, fig.height=11}
+
+driver_region_plot <- plot_driver_panels(
+  priority_contributions %>%
+    inner_join(species_region %>%
+                 mutate(region = ifelse(region %in% c("Western Amazon", "Eastern Amazon"), "Amazon", region)) %>%
+                 distinct(region, binomial),
+               by = "binomial", relationship = "many-to-many"),
+  "region",
+  c("Amazon", "Atlantic Forest", "Cerrado", "Caatinga", "Pantanal", "Pampa")
+)
+
+driver_region_plot
+
+save_figure(driver_region_plot, "FigS53_score_drivers_by_biome", width = 11, height = 11, type = "supplementary")
+
+rm(driver_region_plot, score_contributions, priority_contributions, plot_driver_panels)
+
+```
+
+# 5. Save outputs
+
+```{r}
+
+save_step("4_Barcoding_priorities", c(
+  "EDGE2_species",
+  "priority_species_flags",
+  "priority_long",
+  "missing_range_maps",
+  "priorities_by_region",
+  "priority_peaks_by_region",
+  "priority_by_order",
+  "category_composition",
+  "threatened_by_region",
+  "species_region"
+))
+
+```
+
+This completes the analysis.
+
+```{r}
+
+sessionInfo()
+
+```

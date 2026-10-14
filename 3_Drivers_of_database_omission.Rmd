@@ -1,0 +1,2712 @@
+---
+title: "Part 3: Drivers of reference database omission"
+author: "Thomas Luypaert"
+date: "2026-09-25"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+source(here::here("R", "io.R"))
+source(here::here("R", "figures.R"))
+```
+
+# Welcome
+
+This is Part 3 of the analysis for the paper *"Knowledge Gaps and Sequencing Priorities for Mammalian eDNA Metabarcoding in the World's Largest Tropical Forest Country"*. It uses the species data prepared in `1_Prepare_data.Rmd` and the database completeness from `2_Assess_completeness_ambiguity_complementarity.Rmd`.
+
+In this document, we model which species traits drive the inclusion of Brazilian mammals in reference databases, using Bayesian logistic regression with and without phylogenetic correction.
+
+**Inputs:** `output/intermediate/1_Prepare_data.rds` (Part 1) and `output/intermediate/2_Assess_completeness_ambiguity_complementarity.rds` (Part 2).
+
+**Outputs:** `output/intermediate/3_Drivers_of_database_omission.rds` and the fitted models in `output/models/`, used by Part 4; Figure 3, Tables S2-S3 and the related supplementary figures.
+
+Fitting the models takes several hours. The fitted models are saved in `output/models/` and reused on later runs, unless the data or model specification change. Delete the files in `output/models/` to force a refit.
+
+# 0. Priors
+
+**Load R packages:**
+
+```{r}
+
+library(here)
+library(magrittr)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(colorspace)
+library(stringr)
+library(patchwork)
+library(rphylopic)
+library(brms)
+library(moments)
+library(bayesplot)
+library(ggtext)
+library(sysfonts)
+library(showtext)
+library(posterior)
+library(tidybayes)
+library(ggridges)
+library(cowplot)
+library(ggtree)
+library(ggtreeExtra)
+library(ggnewscale)
+library(scico)
+library(purrr)
+
+```
+
+**Load data from Parts 1 and 2:**
+
+```{r}
+
+load_step("1_Prepare_data", c(
+  "brz_mam_metadata",
+  "brz_mam_taxonomy",
+  "brz_mam_tree",
+  "phylacine_average_vcv_matrix_brz"
+))
+
+load_step("2_Assess_completeness_ambiguity_complementarity", c(
+  "brz_mam_completeness_all"
+))
+
+```
+
+# 1. Explore effect of traits on species database inclusion probability
+
+In this section, we model the probability that a species has at least one reference sequence for a given primer (database inclusion) as a function of species traits (body mass, habitat use, diet), conservation variables (IUCN Red List category, national and biome-level endemism) and indicators of scientific discovery (time since description, range size, human population density within the range), using Bayesian logistic regression. Inclusion is assessed regardless of sequence ambiguity, since the drivers of database inclusion are unrelated to those underlying sequence sharing.
+
+## 1.1. Data preparation
+
+**Combine database completeness with metadata:**
+
+```{r}
+
+  # Add the metadata
+
+brz_mam_completeness_traits_all <- merge(brz_mam_completeness_all, brz_mam_metadata, by = "binomial", all = TRUE)
+
+  # Add the taxonomy
+
+brz_mam_completeness_traits_all <- merge(brz_mam_completeness_traits_all, brz_mam_taxonomy[, c("binomial", "order")], by = "binomial")
+
+```
+
+**Year of description:**
+
+Recently described species are expected to be missing from reference databases, but the effect of time since description can only be detected if enough species were described recently. We summarise the number of species described per decade and their inclusion in the reference databases.
+
+```{r, fig.width=12, fig.height=10}
+
+# 1. Species described per decade, and their inclusion in the reference
+#    databases (percentage of species-primer combinations with a sequence)
+
+description_by_decade <- brz_mam_completeness_traits_all %>%
+  filter(!is.na(year_described)) %>%
+  mutate(decade = floor(year_described / 10) * 10) %>%
+  group_by(decade) %>%
+  summarise(n_species        = n_distinct(binomial),
+            percent_included = mean(presence) * 100,
+            .groups = "drop") %>%
+  mutate(percent_species    = n_species / sum(n_species) * 100,
+         cumulative_percent = cumsum(percent_species))
+
+description_by_decade
+
+save_table(description_by_decade, "species_described_by_decade", type = "additional")
+
+# 2. Inclusion per decade of description, split by locus
+
+inclusion_by_decade_locus <- brz_mam_completeness_traits_all %>%
+  filter(!is.na(year_described)) %>%
+  mutate(decade = floor(year_described / 10) * 10) %>%
+  group_by(region, decade) %>%
+  summarise(percent_included = mean(presence) * 100,
+            n_species        = n_distinct(binomial),
+            .groups = "drop")
+
+inclusion_recent_by_locus <- inclusion_by_decade_locus %>%
+  filter(decade >= 2000) %>%
+  select(region, decade, percent_included) %>%
+  tidyr::pivot_wider(names_from = decade, values_from = percent_included)
+
+inclusion_recent_by_locus
+
+save_table(inclusion_by_decade_locus, "species_described_by_decade_and_locus", type = "additional")
+
+# 3. Species described in the last 10 and 20 years (reference year 2025),
+#    and since 2010 (reported in the main text)
+
+year_described <- brz_mam_metadata$year_described[!is.na(brz_mam_metadata$year_described)]
+
+percent_last_10    <- mean(year_described > 2015) * 100
+percent_last_20    <- mean(year_described > 2005) * 100
+percent_since_2010 <- mean(year_described >= 2010) * 100
+
+cat("Species described since 2010:", round(percent_since_2010, 1), "% of Brazilian mammals\n")
+
+# 4. Plot
+
+locus_colours <- c("12S" = "#68a898", "16S" = "#b62c25", "COI" = "#f6b332", "Cytb" = "#2965a2")
+
+p_described <- ggplot(description_by_decade, aes(x = decade, y = n_species)) +
+  geom_col(fill = "grey60", width = 8) +
+  labs(x = "Decade of description", y = "Number of species described") +
+  theme_classic(base_size = 12)
+
+p_included <- ggplot(description_by_decade, aes(x = decade, y = percent_included)) +
+  geom_line(colour = "grey40") +
+  geom_point(aes(size = n_species), colour = "grey20", alpha = 0.8) +
+  scale_size_continuous(name = "Species") +
+  scale_y_continuous(limits = c(0, 100)) +
+  labs(x = "Decade of description", y = "Species-primer combinations with a sequence (%)") +
+  theme_classic(base_size = 12)
+
+p_included_locus <- ggplot(inclusion_by_decade_locus,
+                           aes(x = decade, y = percent_included, colour = region)) +
+  geom_line() +
+  geom_point(aes(size = n_species), alpha = 0.8) +
+  scale_colour_manual(values = locus_colours) +
+  scale_size_continuous(name = "Species") +
+  scale_y_continuous(limits = c(0, 100)) +
+  labs(x = "Decade of description", y = "Species-primer combinations with a sequence (%)",
+       colour = "Locus") +
+  theme_classic(base_size = 12)
+
+description_plot <- (p_described | p_included) / p_included_locus +
+  plot_annotation(tag_levels = "a")
+
+description_plot
+
+save_figure(description_plot, "FigS26_species_described_by_decade",
+            width = 12, height = 10, type = "supplementary")
+
+rm(p_described, p_included, p_included_locus, description_plot, locus_colours)
+
+```
+
+> **Interpretation**: `r round(percent_last_20, 1)`% of Brazilian mammal species were described in the last 20 years, and `r round(percent_last_10, 1)`% in the last 10 years (`r round(percent_since_2010, 1)`% since 2010), so recent descriptions are not rare. Their inclusion in the reference databases is very low: `r round(description_by_decade$percent_included[description_by_decade$decade == 2010], 1)`% and `r round(description_by_decade$percent_included[description_by_decade$decade == 2020], 1)`% of species-primer combinations have a sequence for species described in the 2010s and 2020s (panel b).
+>
+> The gap depends strongly on the locus (panel c). For species described since 2010, cytochrome b remains the best represented (`r round(inclusion_recent_by_locus[["2010"]][inclusion_recent_by_locus$region == "Cytb"], 1)`% for the 2010s), while 12S and 16S, targeted by most eDNA primers, are almost absent (`r round(inclusion_recent_by_locus[["2010"]][inclusion_recent_by_locus$region == "12S"], 1)`% and `r round(inclusion_recent_by_locus[["2010"]][inclusion_recent_by_locus$region == "16S"], 1)`%). New species are typically described using cytochrome b (and COI for bats), so their sequences are often not available for the loci used in eDNA metabarcoding.
+
+
+```{r}
+
+rm(description_by_decade, inclusion_by_decade_locus, inclusion_recent_by_locus,
+   year_described, percent_last_10, percent_last_20, percent_since_2010)
+
+```
+
+## 1.2. Fitting Bayesian logistic regression models
+
+**Check-out the missingness in our predictor variables:**
+
+```{r}
+
+missing_percent <- sapply(brz_mam_completeness_traits_all, function(x) mean(is.na(x)) * 100)
+
+missing_percent[missing_percent > 0]
+
+```
+
+[Three of our predictors have missing values:]{.underline}
+
+1.  Human population density in range (hum_pop_range): `r round(missing_percent[["hum_pop_range"]], 2)`% missing
+2.  Body mass (BodyMass_g): `r round(missing_percent[["BodyMass_g"]], 2)`% missing
+3.  Range size (RangeSize): `r round(missing_percent[["RangeSize"]], 2)`% missing
+
+We will impute these missing variables using the existing predictors inside the model.
+
+**Prepare the predictor variables for modelling:**
+
+```{r}
+
+# Step 1: Prepare the predictors
+
+#   - Scale continuous predictors
+#   - Set reference levels for categorical predictors
+#   - Explicitly code missing categories where required
+
+
+# Step 1a: Scale continuous predictors
+
+# Time since description (no log transform, scale only)
+
+brz_mam_completeness_traits_all$time_since_description_scaled <-
+  scale(brz_mam_completeness_traits_all$time_since_description)
+
+# Human population within species range (can be zero → log1p, then scale)
+
+brz_mam_completeness_traits_all$hum_pop_range_scaled <-
+  scale(log1p(brz_mam_completeness_traits_all$hum_pop_range))
+
+# Body mass (no zeros → log-transform, keep NAs, then scale)
+
+brz_mam_completeness_traits_all$BodyMass_g_scaled <-
+  scale(log(brz_mam_completeness_traits_all$BodyMass_g))
+
+# Geographic range size (no zeros → log-transform, keep NAs, then scale)
+
+brz_mam_completeness_traits_all$RangeSize_scaled <-
+  scale(log(brz_mam_completeness_traits_all$RangeSize))
+
+
+# Step 1b: Set reference categories for categorical predictors
+
+# Primer and taxonomic identity
+
+brz_mam_completeness_traits_all$primer    <- as.factor(brz_mam_completeness_traits_all$primer)
+brz_mam_completeness_traits_all$binomial <- as.factor(brz_mam_completeness_traits_all$binomial)
+
+# Endemism
+
+brz_mam_completeness_traits_all$brazilian_endemic <-
+  factor(brz_mam_completeness_traits_all$brazilian_endemic)
+brz_mam_completeness_traits_all$brazilian_endemic <-
+  relevel(brz_mam_completeness_traits_all$brazilian_endemic, ref = "No")
+
+brz_mam_completeness_traits_all$regional_endemic <-
+  factor(brz_mam_completeness_traits_all$regional_endemic)
+brz_mam_completeness_traits_all$regional_endemic <-
+  relevel(brz_mam_completeness_traits_all$regional_endemic, ref = "No")
+
+# Conservation status
+
+brz_mam_completeness_traits_all$iucn_status <-
+  factor(brz_mam_completeness_traits_all$iucn_status)
+brz_mam_completeness_traits_all$iucn_status <-
+  relevel(brz_mam_completeness_traits_all$iucn_status, ref = "LC")
+
+# Locomotion
+
+brz_mam_completeness_traits_all$locomotion <-
+  factor(brz_mam_completeness_traits_all$locomotion)
+brz_mam_completeness_traits_all$locomotion <-
+  relevel(brz_mam_completeness_traits_all$locomotion, ref = "Te")
+
+
+# Step 1c: Dietary guilds (binary predictors)
+
+#   - Reference level set to absence ("0")
+
+brz_mam_completeness_traits_all$Frugivore     <- relevel(as.factor(brz_mam_completeness_traits_all$Frugivore),     ref = "0")
+brz_mam_completeness_traits_all$Omnivore      <- relevel(as.factor(brz_mam_completeness_traits_all$Omnivore),      ref = "0")
+brz_mam_completeness_traits_all$Piscivore     <- relevel(as.factor(brz_mam_completeness_traits_all$Piscivore),     ref = "0")
+brz_mam_completeness_traits_all$Insectivore   <- relevel(as.factor(brz_mam_completeness_traits_all$Insectivore),   ref = "0")
+brz_mam_completeness_traits_all$Herbivore     <- relevel(as.factor(brz_mam_completeness_traits_all$Herbivore),     ref = "0")
+brz_mam_completeness_traits_all$Myrmecivore   <- relevel(as.factor(brz_mam_completeness_traits_all$Myrmecivore),   ref = "0")
+brz_mam_completeness_traits_all$Folivore      <- relevel(as.factor(brz_mam_completeness_traits_all$Folivore),      ref = "0")
+brz_mam_completeness_traits_all$Seminivore    <- relevel(as.factor(brz_mam_completeness_traits_all$Seminivore),    ref = "0")
+brz_mam_completeness_traits_all$Gummivore     <- relevel(as.factor(brz_mam_completeness_traits_all$Gummivore),     ref = "0")
+brz_mam_completeness_traits_all$Granivore     <- relevel(as.factor(brz_mam_completeness_traits_all$Granivore),     ref = "0")
+brz_mam_completeness_traits_all$Planktivore   <- relevel(as.factor(brz_mam_completeness_traits_all$Planktivore),   ref = "0")
+brz_mam_completeness_traits_all$Teutophage    <- relevel(as.factor(brz_mam_completeness_traits_all$Teutophage),    ref = "0")
+brz_mam_completeness_traits_all$Carnivore     <- relevel(as.factor(brz_mam_completeness_traits_all$Carnivore),     ref = "0")
+brz_mam_completeness_traits_all$Hemovore      <- relevel(as.factor(brz_mam_completeness_traits_all$Hemovore),      ref = "0")
+brz_mam_completeness_traits_all$Nectarivore   <- relevel(as.factor(brz_mam_completeness_traits_all$Nectarivore),   ref = "0")
+
+
+```
+
+**Fit a baseline model (no predictors):**
+
+All models are fitted with a fixed seed and saved in `output/models/`. On later runs, the saved model is loaded instead of refitted, unless the data or model specification have changed.
+
+```{r}
+
+fit_0 <- brm(
+  formula = bf(presence ~ 1),
+  data = brz_mam_completeness_traits_all,
+  family = bernoulli("logit"),
+  prior = prior(normal(0, 1), class = "Intercept"),
+  sample_prior = TRUE,
+  chains = 4,
+  iter = 4000,
+  warmup = 2000,
+  cores = 4,
+  seed = 12345,
+  save_pars = save_pars(all = TRUE),
+  control = list(adapt_delta = 0.95),
+  file = model_file("fit_0"),
+  file_refit = "on_change"
+)
+
+```
+
+**Fit a model without phylogenetic correction (Model 1):**
+
+```{r}
+
+fit_1 <- brm(
+  
+  # Presence model
+  
+  bf(presence ~ time_since_description_scaled + brazilian_endemic + iucn_status +
+       locomotion + Frugivore + Omnivore + Piscivore + Insectivore + Herbivore +
+       Myrmecivore + Folivore + Gummivore + Seminivore + Granivore + Carnivore +
+       Hemovore + Nectarivore + regional_endemic +
+       mi(hum_pop_range_scaled) + mi(BodyMass_g_scaled) + mi(RangeSize_scaled) + (1 | primer)) +
+    
+  # Imputation submodels for predictors with missing values
+    
+  bf(BodyMass_g_scaled | mi() ~ time_since_description_scaled + brazilian_endemic + iucn_status + locomotion + Frugivore + Omnivore + Piscivore + Insectivore + Herbivore + Myrmecivore + Folivore + Gummivore + Seminivore + Granivore + Carnivore + Hemovore + Nectarivore + regional_endemic,
+     family = gaussian()) +
+  bf(hum_pop_range_scaled | mi() ~ time_since_description_scaled + brazilian_endemic + iucn_status + locomotion + Frugivore + Omnivore + Piscivore + Insectivore + Herbivore + Myrmecivore + Folivore + Gummivore + Seminivore + Granivore + Carnivore + Hemovore + Nectarivore + regional_endemic,
+     family = gaussian()) +
+  bf(RangeSize_scaled | mi() ~ time_since_description_scaled + brazilian_endemic + iucn_status + locomotion + Frugivore + Omnivore + Piscivore + Insectivore + Herbivore + Myrmecivore + Folivore + Gummivore + Seminivore + Granivore + Carnivore + Hemovore + Nectarivore + regional_endemic,
+     family = gaussian()),
+
+  data = brz_mam_completeness_traits_all,
+  family = list(bernoulli(), gaussian(), gaussian(), gaussian()),
+
+  prior = c(
+    
+    # Presence model
+    
+    prior(normal(0, 0.5), class = "b", resp = "presence"),
+    prior(normal(0, 1), class = "Intercept", resp = "presence"),
+    prior(normal(0, 0.5), class = "sd", resp = "presence"),
+
+    # Imputation submodels
+    
+    prior(normal(0, 0.5), class = "b", resp = "humpoprangescaled"),
+    prior(normal(0, 1), class = "Intercept", resp = "humpoprangescaled"),
+    prior(student_t(3, 0, 1), class = "sigma", resp = "humpoprangescaled"),
+
+    prior(normal(0, 0.5), class = "b", resp = "BodyMassgscaled"),
+    prior(normal(0, 1), class = "Intercept", resp = "BodyMassgscaled"),
+    prior(student_t(3, 0, 1), class = "sigma", resp = "BodyMassgscaled"),
+
+    prior(normal(0, 0.5), class = "b", resp = "RangeSizescaled"),
+    prior(normal(0, 1), class = "Intercept", resp = "RangeSizescaled"),
+    prior(student_t(3, 0, 1), class = "sigma", resp = "RangeSizescaled")
+  ),
+
+  chains = 4,
+  iter = 4000,
+  warmup = 2000,
+  cores = 4,
+  seed = 12345,
+  control = list(adapt_delta = 0.98, max_treedepth = 15),
+  save_pars = save_pars(all = TRUE),
+  sample_prior = FALSE,
+  file = model_file("fit_1"),
+  file_refit = "on_change"
+)
+
+```
+
+**Fit a model with phylogenetic correction (Model 2):**
+
+```{r}
+
+# 1. Order the phylogenetic correlation matrix as the species factor levels
+
+correct_order <- levels(factor(brz_mam_completeness_traits_all$binomial))
+
+phylacine_average_vcv_matrix_brz <- phylacine_average_vcv_matrix_brz[correct_order, correct_order]
+
+rm(correct_order)
+
+# 2. Fit the model
+
+fit_2 <- brm(
+  
+  # Presence model, with a phylogenetic random effect
+  
+  bf(presence ~ time_since_description_scaled + brazilian_endemic + iucn_status +
+       locomotion + Frugivore + Omnivore + Piscivore + Insectivore + Herbivore +
+       Myrmecivore + Folivore + Gummivore + Seminivore + Granivore + Carnivore +
+       Hemovore + Nectarivore + regional_endemic +
+       mi(hum_pop_range_scaled) + mi(BodyMass_g_scaled) + mi(RangeSize_scaled) + (1 | primer) +
+       (1 | gr(binomial, cov = phylacine_average_vcv_matrix_brz))) +
+    
+  # Imputation submodels for predictors with missing values
+    
+  bf(BodyMass_g_scaled | mi() ~ time_since_description_scaled + brazilian_endemic + iucn_status + locomotion + Frugivore + Omnivore + Piscivore + Insectivore + Herbivore + Myrmecivore + Folivore + Gummivore + Seminivore + Granivore + Carnivore + Hemovore + Nectarivore + regional_endemic,
+     family = gaussian()) +
+  bf(hum_pop_range_scaled | mi() ~ time_since_description_scaled + brazilian_endemic + iucn_status + locomotion + Frugivore + Omnivore + Piscivore + Insectivore + Herbivore + Myrmecivore + Folivore + Gummivore + Seminivore + Granivore + Carnivore + Hemovore + Nectarivore + regional_endemic,
+     family = gaussian()) +
+  bf(RangeSize_scaled | mi() ~ time_since_description_scaled + brazilian_endemic + iucn_status + locomotion + Frugivore + Omnivore + Piscivore + Insectivore + Herbivore + Myrmecivore + Folivore + Gummivore + Seminivore + Granivore + Carnivore + Hemovore + Nectarivore + regional_endemic,
+     family = gaussian()),
+
+  data = brz_mam_completeness_traits_all,
+  data2 = list(phylacine_average_vcv_matrix_brz = phylacine_average_vcv_matrix_brz),
+  family = list(bernoulli(), gaussian(), gaussian(), gaussian()),
+
+  prior = c(
+    
+    # Presence model
+    
+    prior(normal(0, 0.5), class = "b", resp = "presence"),
+    prior(normal(0, 1), class = "Intercept", resp = "presence"),
+    prior(normal(0, 0.5), class = "sd", resp = "presence"),
+
+    # Imputation submodels
+    
+    prior(normal(0, 0.5), class = "b", resp = "humpoprangescaled"),
+    prior(normal(0, 1), class = "Intercept", resp = "humpoprangescaled"),
+    prior(student_t(3, 0, 1), class = "sigma", resp = "humpoprangescaled"),
+
+    prior(normal(0, 0.5), class = "b", resp = "BodyMassgscaled"),
+    prior(normal(0, 1), class = "Intercept", resp = "BodyMassgscaled"),
+    prior(student_t(3, 0, 1), class = "sigma", resp = "BodyMassgscaled"),
+
+    prior(normal(0, 0.5), class = "b", resp = "RangeSizescaled"),
+    prior(normal(0, 1), class = "Intercept", resp = "RangeSizescaled"),
+    prior(student_t(3, 0, 1), class = "sigma", resp = "RangeSizescaled")
+  ),
+
+  chains = 4,
+  iter = 4000,
+  warmup = 2000,
+  cores = 4,
+  seed = 12345,
+  control = list(adapt_delta = 0.98, max_treedepth = 15),
+  save_pars = save_pars(all = TRUE),
+  sample_prior = FALSE,
+  file = model_file("fit_2"),
+  file_refit = "on_change"
+)
+
+```
+
+## 1.3. Inspecting and plotting results
+
+**Posterior predictive checks:**
+
+[Main models (Model 1 and Model 2)]{.underline}:
+
+```{r, fig.width = 21, fig.height=21}
+
+
+font_add_google("Roboto Condensed", "roboto_condensed")
+showtext_auto()
+showtext_opts(dpi = 400)
+
+nc_theme <- theme_minimal(base_size = 14, base_family = "roboto_condensed") +
+  theme(
+    plot.title       = element_blank(),
+    axis.line        = element_line(colour = "black", linewidth = 0.4),
+    axis.ticks       = element_line(colour = "black", linewidth = 0.4),
+    panel.border     = element_blank(),
+    panel.background = element_blank(),
+    panel.grid       = element_blank(),
+    axis.text        = element_text(size = 16, colour = "black"),
+    axis.title.x     = element_text(size = 18, colour = "black", face = "bold",
+                                    margin = margin(t = 12)),
+    axis.title.y     = element_text(size = 18, colour = "black", face = "bold",
+                                    margin = margin(r = 12)),
+    plot.margin      = margin(12, 12, 12, 12)
+  )
+
+
+# Model 1: Posterior predictive check plot 
+# Panel a: bar plot; Panel b: SD histogram; Panel c: skewness histogram; 
+# Panel d: per-primer mean. 
+
+p_bars_1 <- pp_check(fit_1, type = "bars", ndraws = 1000, resp = "presence") +
+  nc_theme
+
+p_sd_1 <- pp_check(fit_1, type = "stat", stat = "sd", ndraws = 1000, resp = "presence") +
+  nc_theme +
+  scale_x_continuous(
+    breaks = scales::pretty_breaks(n = 2),
+    labels = scales::label_number(accuracy = 0.001)
+  )
+
+p_skew_1 <- pp_check(fit_1, type = "stat", stat = "skewness", ndraws = 1000, resp = "presence") +
+  nc_theme +
+  scale_x_continuous(
+    breaks = scales::pretty_breaks(n = 3),
+    labels = scales::label_number(accuracy = 0.01)
+  )
+
+p_primer_1 <- pp_check(fit_1, type = "stat_grouped", group = "primer", stat = "mean", 
+                       ndraws = 1000, resp = "presence") +
+  nc_theme +
+  theme(
+    strip.text  = element_text(size = 14, face = "bold", family = "roboto_condensed"),
+    axis.text.x = element_text(size = 11, angle = 45, hjust = 1),
+    axis.text.y = element_text(size = 11),
+    axis.title  = element_blank()
+  ) +
+  scale_x_continuous(breaks = scales::pretty_breaks(n = 3))
+
+composite_ppc_model1 <- (p_bars_1 | p_sd_1 | p_skew_1) / p_primer_1 +
+  plot_layout(heights = c(1, 1.4)) +
+  plot_annotation(tag_levels = "a", tag_suffix = ".") &
+  theme(plot.tag = element_text(size = 20, face = "bold", family = "roboto_condensed"))
+
+composite_ppc_model1
+
+save_figure(composite_ppc_model1, "FigS28_ppc_model1", width = 13, height = 9, type = "supplementary")
+
+# Model 2: Posterior predictive check plot 
+# Panel a: bar plot; Panel b: SD histogram; Panel c: skewness histogram; 
+# Panel d: per-primer mean; Panel e: per-order mean
+
+order_lookup <- brz_mam_taxonomy %>%
+  select(binomial, order) %>%
+  distinct()
+
+model_data_with_order <- fit_2$data %>%
+  left_join(order_lookup, by = "binomial")
+
+stopifnot(nrow(model_data_with_order) == nrow(fit_2$data))  # no row duplication
+stopifnot(sum(is.na(model_data_with_order$order)) == 0)      # every row matched
+
+# Number of rows per order (orders with few rows give a noisy check in panel e)
+print(table(model_data_with_order$order))
+
+fit_2$data$order <- model_data_with_order$order
+
+p_bars_2 <- pp_check(fit_2, type = "bars", ndraws = 1000, resp = "presence") +
+  nc_theme
+
+p_sd_2 <- pp_check(fit_2, type = "stat", stat = "sd", ndraws = 1000, resp = "presence") +
+  nc_theme +
+  scale_x_continuous(
+    breaks = scales::pretty_breaks(n = 3),
+    labels = scales::label_number(accuracy = 0.001)
+  )
+
+p_skew_2 <- pp_check(fit_2, type = "stat", stat = "skewness", ndraws = 1000, resp = "presence") +
+  nc_theme +
+  scale_x_continuous(
+    breaks = scales::pretty_breaks(n = 3),
+    labels = scales::label_number(accuracy = 0.01)
+  )
+
+p_primer_2 <- pp_check(fit_2, type = "stat_grouped", group = "primer", stat = "mean", 
+                       ndraws = 1000, resp = "presence") +
+  nc_theme +
+  theme(
+    strip.text  = element_text(size = 14, face = "bold", family = "roboto_condensed"),
+    axis.text.x = element_text(size = 11, angle = 45, hjust = 1),
+    axis.text.y = element_text(size = 11),
+    axis.title  = element_blank()
+  ) +
+  scale_x_continuous(breaks = scales::pretty_breaks(n = 3))
+
+p_order_2 <- pp_check(fit_2, type = "stat_grouped", group = "order", stat = "mean", 
+                      ndraws = 1000, resp = "presence") +
+  nc_theme +
+  theme(
+    strip.text  = element_text(size = 14, face = "bold", family = "roboto_condensed"),
+    axis.text.x = element_text(size = 11, angle = 45, hjust = 1),
+    axis.text.y = element_text(size = 11),
+    axis.title  = element_blank()
+  ) +
+  scale_x_continuous(breaks = scales::pretty_breaks(n = 3))
+
+composite_ppc_model2 <- (p_bars_2 | p_sd_2 | p_skew_2) / p_primer_2 / p_order_2 +
+  plot_layout(heights = c(1, 1.4, 1.4)) +
+  plot_annotation(tag_levels = "a", tag_suffix = ".") &
+  theme(plot.tag = element_text(size = 20, face = "bold", family = "roboto_condensed"))
+
+composite_ppc_model2
+
+save_figure(composite_ppc_model2, "FigS39_ppc_model2", width = 13, height = 13, type = "supplementary")
+
+```
+
+[Null model and imputation sub-models]{.underline}:
+
+```{r, fig.width= 21, fig.height=7}
+
+
+
+# Null model 
+
+p_bars_0 <- pp_check(fit_0, type = "bars", ndraws = 1000) +
+  nc_theme
+
+plot_0 <- p_bars_0 +
+  plot_annotation() &
+  theme(plot.tag = element_text(size = 20, face = "bold", family = "roboto_condensed"))
+
+plot_0
+
+save_figure(plot_0, "FigS27_ppc_model0", width = 6, height = 5, type = "supplementary")
+
+# Model 1 imputation submodels 
+
+p_dens_1_bm <- pp_check(fit_1, ndraws = 1000, type = "dens_overlay", resp = "BodyMassgscaled") + nc_theme
+p_scat_1_bm <- pp_check(fit_1, ndraws = 1000, type = "scatter_avg", resp = "BodyMassgscaled") + nc_theme
+p_mean_1_bm <- pp_check(fit_1, ndraws = 1000, type = "stat", stat = "mean", resp = "BodyMassgscaled") + nc_theme
+
+plot_1_bodymass <- (p_dens_1_bm | p_scat_1_bm | p_mean_1_bm) +
+  plot_annotation(tag_levels = "a", tag_suffix = ".") &
+  theme(plot.tag = element_text(size = 20, face = "bold", family = "roboto_condensed"))
+
+plot_1_bodymass
+
+save_figure(plot_1_bodymass, "FigS29_ppc_model1_body_mass", width = 15, height = 5, type = "supplementary")
+
+p_dens_1_hp <- pp_check(fit_1, ndraws = 1000, type = "dens_overlay", resp = "humpoprangescaled") + nc_theme
+p_scat_1_hp <- pp_check(fit_1, ndraws = 1000, type = "scatter_avg", resp = "humpoprangescaled") + nc_theme
+p_mean_1_hp <- pp_check(fit_1, ndraws = 1000, type = "stat", stat = "mean", resp = "humpoprangescaled") + nc_theme
+
+plot_1_humpop <- (p_dens_1_hp | p_scat_1_hp | p_mean_1_hp) +
+  plot_annotation(tag_levels = "a", tag_suffix = ".") &
+  theme(plot.tag = element_text(size = 20, face = "bold", family = "roboto_condensed"))
+
+plot_1_humpop
+
+save_figure(plot_1_humpop, "FigS30_ppc_model1_human_population", width = 15, height = 5, type = "supplementary")
+
+p_dens_1_rs <- pp_check(fit_1, ndraws = 1000, type = "dens_overlay", resp = "RangeSizescaled") + nc_theme
+p_scat_1_rs <- pp_check(fit_1, ndraws = 1000, type = "scatter_avg", resp = "RangeSizescaled") + nc_theme
+p_mean_1_rs <- pp_check(fit_1, ndraws = 1000, type = "stat", stat = "mean", resp = "RangeSizescaled") + nc_theme
+
+plot_1_rangesize <- (p_dens_1_rs | p_scat_1_rs | p_mean_1_rs) +
+  plot_annotation(tag_levels = "a", tag_suffix = ".") &
+  theme(plot.tag = element_text(size = 20, face = "bold", family = "roboto_condensed"))
+
+plot_1_rangesize
+
+save_figure(plot_1_rangesize, "FigS31_ppc_model1_range_size", width = 15, height = 5, type = "supplementary")
+
+# Model 2 imputation submodels
+
+p_dens_2_bm <- pp_check(fit_2, ndraws = 1000, type = "dens_overlay", resp = "BodyMassgscaled") + nc_theme
+p_scat_2_bm <- pp_check(fit_2, ndraws = 1000, type = "scatter_avg", resp = "BodyMassgscaled") + nc_theme
+p_mean_2_bm <- pp_check(fit_2, ndraws = 1000, type = "stat", stat = "mean", resp = "BodyMassgscaled") + nc_theme
+
+plot_2_bodymass <- (p_dens_2_bm | p_scat_2_bm | p_mean_2_bm) +
+  plot_annotation(tag_levels = "a", tag_suffix = ".") &
+  theme(plot.tag = element_text(size = 20, face = "bold", family = "roboto_condensed"))
+
+plot_2_bodymass
+
+save_figure(plot_2_bodymass, "FigS40_ppc_model2_body_mass", width = 15, height = 5, type = "supplementary")
+
+p_dens_2_hp <- pp_check(fit_2, ndraws = 1000, type = "dens_overlay", resp = "humpoprangescaled") + nc_theme
+p_scat_2_hp <- pp_check(fit_2, ndraws = 1000, type = "scatter_avg", resp = "humpoprangescaled") + nc_theme
+p_mean_2_hp <- pp_check(fit_2, ndraws = 1000, type = "stat", stat = "mean", resp = "humpoprangescaled") + nc_theme
+
+plot_2_humpop <- (p_dens_2_hp | p_scat_2_hp | p_mean_2_hp) +
+  plot_annotation(tag_levels = "a", tag_suffix = ".") &
+  theme(plot.tag = element_text(size = 20, face = "bold", family = "roboto_condensed"))
+
+plot_2_humpop
+
+save_figure(plot_2_humpop, "FigS41_ppc_model2_human_population", width = 15, height = 5, type = "supplementary")
+
+p_dens_2_rs <- pp_check(fit_2, ndraws = 1000, type = "dens_overlay", resp = "RangeSizescaled") + nc_theme
+p_scat_2_rs <- pp_check(fit_2, ndraws = 1000, type = "scatter_avg", resp = "RangeSizescaled") + nc_theme
+p_mean_2_rs <- pp_check(fit_2, ndraws = 1000, type = "stat", stat = "mean", resp = "RangeSizescaled") + nc_theme
+
+plot_2_rangesize <- (p_dens_2_rs | p_scat_2_rs | p_mean_2_rs) +
+  plot_annotation(tag_levels = "a", tag_suffix = ".") &
+  theme(plot.tag = element_text(size = 20, face = "bold", family = "roboto_condensed"))
+
+plot_2_rangesize
+
+save_figure(plot_2_rangesize, "FigS42_ppc_model2_range_size", width = 15, height = 5, type = "supplementary")
+
+```
+
+[Trace plots]{.underline}:
+
+Next, we will assess the trace plots for the three models, which should look like hairy caterpillars, indicating the chains are mixed well.
+
+```{r}
+
+
+# Extract presence-submodel parameters only (fixed + random effects).
+# brms names mi()-wrapped predictor coefficients with a "bsp_" prefix
+# rather than "b_" - both need to be matched here.
+
+draws_1 <- as_draws_array(fit_1)
+all_pars_1 <- variables(draws_1)
+
+presence_pars_1 <- all_pars_1[
+  grepl("^b_presence_|^bsp_presence_", all_pars_1) |
+    grepl("^sd_.*presence", all_pars_1)
+]
+
+presence_pars_1
+
+draws_2 <- as_draws_array(fit_2)
+all_pars_2 <- variables(draws_2)
+
+presence_pars_2 <- all_pars_2[
+  grepl("^b_presence_|^bsp_presence_", all_pars_2) |
+    grepl("^sd_.*presence", all_pars_2)
+]
+
+presence_pars_2
+
+# Lookup table: raw parameter name -> clean display label
+
+param_labels <- c(
+  "b_presence_Intercept"                        = "Intercept",
+  "sd_primer__presence_Intercept"                = "Primer (SD)",
+  "sd_binomial__presence_Intercept"              = "Phylogeny (SD)",
+  "b_presence_time_since_description_scaled"     = "Time since description",
+  "bsp_presence_miBodyMass_g_scaled"              = "Body mass",
+  "bsp_presence_miRangeSize_scaled"               = "Range size",
+  "bsp_presence_mihum_pop_range_scaled"           = "Human population density",
+  "b_presence_brazilian_endemicUnknown"          = "National endemism: Unknown",
+  "b_presence_brazilian_endemicYes"              = "National endemism: Yes",
+  "b_presence_regional_endemicAmazonia"          = "Regional endemism: Amazonia",
+  "b_presence_regional_endemicAtlantic_forest"   = "Regional endemism: Atlantic forest",
+  "b_presence_regional_endemicCaatinga"          = "Regional endemism: Caatinga",
+  "b_presence_regional_endemicCerrado"           = "Regional endemism: Cerrado",
+  "b_presence_regional_endemicCerrado_Caatinga"  = "Regional endemism: Cerrado/Caatinga",
+  "b_presence_regional_endemicPampa"             = "Regional endemism: Pampa",
+  "b_presence_regional_endemicPantanal"          = "Regional endemism: Pantanal",
+  "b_presence_iucn_statusCR"                     = "IUCN: Critically endangered",
+  "b_presence_iucn_statusDD"                     = "IUCN: Data deficient",
+  "b_presence_iucn_statusEN"                     = "IUCN: Endangered",
+  "b_presence_iucn_statusEX"                     = "IUCN: Extinct",
+  "b_presence_iucn_statusNT"                     = "IUCN: Near-threatened",
+  "b_presence_iucn_statusUA"                     = "IUCN: Unassessed",
+  "b_presence_iucn_statusVU"                     = "IUCN: Vulnerable",
+  "b_presence_locomotionAq"                      = "Aquatic",
+  "b_presence_locomotionAr"                      = "Arboreal",
+  "b_presence_locomotionFs"                      = "Fossorial",
+  "b_presence_locomotionSA"                      = "Semi-aquatic",
+  "b_presence_locomotionSc"                      = "Scansorial",
+  "b_presence_locomotionSF"                      = "Semi-fossorial",
+  "b_presence_locomotionVo"                      = "Volant",
+  "b_presence_Frugivore1"                        = "Frugivore",
+  "b_presence_Omnivore1"                         = "Omnivore",
+  "b_presence_Piscivore1"                        = "Piscivore",
+  "b_presence_Insectivore1"                      = "Insectivore",
+  "b_presence_Herbivore1"                        = "Herbivore",
+  "b_presence_Myrmecivore1"                      = "Myrmecivore",
+  "b_presence_Folivore1"                         = "Folivore",
+  "b_presence_Gummivore1"                        = "Gummivore",
+  "b_presence_Seminivore1"                       = "Seminivore",
+  "b_presence_Granivore1"                        = "Granivore",
+  "b_presence_Carnivore1"                        = "Carnivore",
+  "b_presence_Hemovore1"                         = "Hemovore",
+  "b_presence_Nectarivore1"                      = "Nectarivore"
+)
+
+clean_labeller <- ggplot2::as_labeller(param_labels)
+
+# Split parameters into logical groups by predictor category, per model
+
+groups_1 <- list(
+  intercept_random    = presence_pars_1[grepl("Intercept$|^sd_", presence_pars_1)],
+  continuous          = presence_pars_1[grepl("time_since_description|miBodyMass|miRangeSize|mihum_pop_range", presence_pars_1)],
+  national_endemism   = presence_pars_1[grepl("brazilian_endemic", presence_pars_1)],
+  regional_endemism   = presence_pars_1[grepl("regional_endemic", presence_pars_1)],
+  iucn_status         = presence_pars_1[grepl("iucn_status", presence_pars_1)],
+  locomotion          = presence_pars_1[grepl("locomotion", presence_pars_1)],
+  diet                = presence_pars_1[grepl("Frugivore|Omnivore|Piscivore|Insectivore|Herbivore|Myrmecivore|Folivore|Gummivore|Seminivore|Granivore|Carnivore|Hemovore|Nectarivore", presence_pars_1)]
+)
+
+sapply(groups_1, length)
+stopifnot(sum(sapply(groups_1, length)) == length(presence_pars_1))
+
+groups_2 <- list(
+  intercept_random    = presence_pars_2[grepl("Intercept$|^sd_", presence_pars_2)],
+  continuous          = presence_pars_2[grepl("time_since_description|miBodyMass|miRangeSize|mihum_pop_range", presence_pars_2)],
+  national_endemism   = presence_pars_2[grepl("brazilian_endemic", presence_pars_2)],
+  regional_endemism   = presence_pars_2[grepl("regional_endemic", presence_pars_2)],
+  iucn_status         = presence_pars_2[grepl("iucn_status", presence_pars_2)],
+  locomotion          = presence_pars_2[grepl("locomotion", presence_pars_2)],
+  diet                = presence_pars_2[grepl("Frugivore|Omnivore|Piscivore|Insectivore|Herbivore|Myrmecivore|Folivore|Gummivore|Seminivore|Granivore|Carnivore|Hemovore|Nectarivore", presence_pars_2)]
+)
+
+sapply(groups_2, length)
+stopifnot(sum(sapply(groups_2, length)) == length(presence_pars_2))
+
+# Build, theme and save one trace-plot figure for a parameter group
+
+make_trace_figure <- function(draws, pars, filename_stem, ncol_facets = 2) {
+  
+  p <- mcmc_trace(draws, pars = pars, 
+                  facet_args = list(labeller = clean_labeller, ncol = ncol_facets)) +
+    labs(x = "Post-warmup iteration", y = "Parameter value") +
+    nc_theme +
+    theme(
+      strip.text = element_text(size = 11, face = "bold", family = "roboto_condensed"),
+      axis.text  = element_text(size = 12, family = "roboto_condensed"),
+      legend.position = "top"
+    )
+  
+  n_pars  <- length(pars)
+  n_rows  <- ceiling(n_pars / ncol_facets)
+  
+  fig_width  <- ncol_facets * 6      # ~6in per column
+  fig_height <- n_rows * 3 + 1.5     # ~3in per row, + margin/legend allowance
+  
+  save_figure(p, filename_stem, width = fig_width, height = fig_height, type = "supplementary")
+  
+  return(p)
+}
+
+# Trace plots - Model 1, one figure per parameter group
+
+trace_1_intercept_random  <- make_trace_figure(draws_1, groups_1$intercept_random, "FigS32_traceplots_model1_intercept_random")
+trace_1_continuous        <- make_trace_figure(draws_1, groups_1$continuous, "FigS33_traceplots_model1_continuous")
+trace_1_national_endemism <- make_trace_figure(draws_1, groups_1$national_endemism, "FigS37_traceplots_model1_national_endemism")
+trace_1_regional_endemism <- make_trace_figure(draws_1, groups_1$regional_endemism, "FigS38_traceplots_model1_regional_endemism")
+trace_1_iucn               <- make_trace_figure(draws_1, groups_1$iucn_status, "FigS35_traceplots_model1_iucn_status")
+trace_1_locomotion         <- make_trace_figure(draws_1, groups_1$locomotion, "FigS36_traceplots_model1_locomotion")
+trace_1_diet <- make_trace_figure(draws_1, groups_1$diet, "FigS34_traceplots_model1_diet", ncol_facets = 3)
+
+# Trace plots - Model 2, one figure per parameter group
+
+trace_2_intercept_random  <- make_trace_figure(draws_2, groups_2$intercept_random, "FigS43_traceplots_model2_intercept_random")
+trace_2_continuous        <- make_trace_figure(draws_2, groups_2$continuous, "FigS44_traceplots_model2_continuous")
+trace_2_national_endemism <- make_trace_figure(draws_2, groups_2$national_endemism, "FigS48_traceplots_model2_national_endemism")
+trace_2_regional_endemism <- make_trace_figure(draws_2, groups_2$regional_endemism, "FigS49_traceplots_model2_regional_endemism")
+trace_2_iucn               <- make_trace_figure(draws_2, groups_2$iucn_status, "FigS46_traceplots_model2_iucn_status")
+trace_2_locomotion         <- make_trace_figure(draws_2, groups_2$locomotion, "FigS47_traceplots_model2_locomotion")
+trace_2_diet <- make_trace_figure(draws_2, groups_2$diet, "FigS45_traceplots_model2_diet", ncol_facets = 3)
+
+
+
+```
+
+**Convergence diagnostics:**
+
+First, we check the Rhat values, which is used to assess the convergence of the models. If Rhat values are close to 1 across all predictors, this is a sign that the different chains have converged well.
+
+[Fixed effects]{.underline}:
+
+```{r}
+# Null model Rhat values  
+
+summary(fit_0)$fixed[, 5:7] 
+```
+
+```{r}
+# Model 1: no taxonomy - Rhat values  
+summary(fit_1)$fixed[, 5:7] 
+```
+
+```{r}
+# Model 2: with taxonomy - Rhat values  
+summary(fit_2)$fixed[, 5:7] 
+```
+
+```{r}
+# Convergence summary for the text: largest R-hat and smallest effective sample sizes
+
+convergence_summary <- bind_rows(lapply(list(model_1 = fit_1, model_2 = fit_2), function(fit) {
+  summ <- summary(fit)
+  pars <- bind_rows(as.data.frame(summ$fixed), bind_rows(lapply(summ$random, as.data.frame)))
+  data.frame(max_rhat = max(pars$Rhat), min_bulk_ess = min(pars$Bulk_ESS), min_tail_ess = min(pars$Tail_ESS))
+}), .id = "model")
+
+convergence_summary
+```
+
+[Random effects]{.underline}:
+
+```{r}
+
+# Model 1: no taxonomy - random effects (primer)
+summary(fit_1)$random$primer[, 5:7]
+
+```
+
+```{r}
+
+# Model 2: with taxonomy - random effects (primer + phylogeny)
+summary(fit_2)$random$primer[, 5:7]
+summary(fit_2)$random$binomial[, 5:7]
+
+```
+
+[Parameter tables (Tables S2 and S3)]{.underline}:
+
+```{r}
+
+
+
+models <- list(Model_1 = fit_1, Model_2 = fit_2)
+
+# Lookup: raw brms parameter name -> clean display label + group
+
+param_lookup <- tribble(
+  ~parameter,                                        ~label,                                              ~group,
+  "presence_Intercept",                               "Intercept",                                         "Intercept",
+  "primer: sd(presence_Intercept)",                    "Primer (sd)",                                       "Random effects",
+  "binomial: sd(presence_Intercept)",                  "Phylogeny (sd)",                                    "Random effects",
+  
+  "presence_miBodyMass_g_scaled",                      "Body mass (g)",                                     "Continuous variables",
+  "presence_miRangeSize_scaled",                       "Range size (km2)",                                  "Continuous variables",
+  "presence_time_since_description_scaled",            "Time since description (years)",                   "Continuous variables",
+  "presence_mihum_pop_range_scaled",                   "Human population density in range (95th perc.)",   "Continuous variables",
+  
+  "presence_regional_endemicCerrado_Caatinga",         "Cerrado/Caatinga",                                  "Regional endemism | Reference category = No",
+  "presence_regional_endemicCaatinga",                 "Caatinga",                                          "Regional endemism | Reference category = No",
+  "presence_regional_endemicAmazonia",                 "Amazonia",                                          "Regional endemism | Reference category = No",
+  "presence_regional_endemicPampa",                    "Pampa",                                             "Regional endemism | Reference category = No",
+  "presence_regional_endemicCerrado",                  "Cerrado",                                           "Regional endemism | Reference category = No",
+  "presence_regional_endemicAtlantic_forest",          "Atlantic forest",                                   "Regional endemism | Reference category = No",
+  "presence_regional_endemicPantanal",                 "Pantanal",                                          "Regional endemism | Reference category = No",
+  
+  "presence_brazilian_endemicUnknown",                 "Unknown",                                           "National endemism | Reference category = No",
+  "presence_brazilian_endemicYes",                     "Yes",                                               "National endemism | Reference category = No",
+  
+  "presence_iucn_statusEN",                            "Endangered",                                        "IUCN Status | Reference category = Least concern",
+  "presence_iucn_statusNT",                            "Near-threatened",                                   "IUCN Status | Reference category = Least concern",
+  "presence_iucn_statusCR",                            "Critically endangered",                             "IUCN Status | Reference category = Least concern",
+  "presence_iucn_statusVU",                            "Vulnerable",                                        "IUCN Status | Reference category = Least concern",
+  "presence_iucn_statusEX",                            "Extinct",                                           "IUCN Status | Reference category = Least concern",
+  "presence_iucn_statusDD",                            "Data deficient",                                    "IUCN Status | Reference category = Least concern",
+  "presence_iucn_statusUA",                            "Unassessed",                                        "IUCN Status | Reference category = Least concern",
+  
+  "presence_locomotionVo",                             "Volant",                                            "Habitat use | Reference category = Terrestrial",
+  "presence_locomotionAr",                             "Arboreal",                                          "Habitat use | Reference category = Terrestrial",
+  "presence_locomotionFs",                             "Fossorial",                                         "Habitat use | Reference category = Terrestrial",
+  "presence_locomotionSc",                             "Scansorial",                                        "Habitat use | Reference category = Terrestrial",
+  "presence_locomotionSF",                             "Semi-fossorial",                                    "Habitat use | Reference category = Terrestrial",
+  "presence_locomotionSA",                             "Semi-aquatic",                                       "Habitat use | Reference category = Terrestrial",
+  "presence_locomotionAq",                             "Aquatic",                                           "Habitat use | Reference category = Terrestrial",
+  
+  "presence_Piscivore1",                               "Piscivore",                                         "Diet | Reference category = 0",
+  "presence_Granivore1",                               "Granivore",                                         "Diet | Reference category = 0",
+  "presence_Frugivore1",                               "Frugivore",                                         "Diet | Reference category = 0",
+  "presence_Gummivore1",                               "Gummivore",                                         "Diet | Reference category = 0",
+  "presence_Omnivore1",                                "Omnivore",                                          "Diet | Reference category = 0",
+  "presence_Carnivore1",                               "Carnivore",                                         "Diet | Reference category = 0",
+  "presence_Herbivore1",                               "Herbivore",                                         "Diet | Reference category = 0",
+  "presence_Insectivore1",                             "Insectivore",                                       "Diet | Reference category = 0",
+  "presence_Hemovore1",                                "Hemovore",                                          "Diet | Reference category = 0",
+  "presence_Nectarivore1",                             "Nectarivore",                                       "Diet | Reference category = 0",
+  "presence_Folivore1",                                "Folivore",                                          "Diet | Reference category = 0",
+  "presence_Myrmecivore1",                             "Myrmecivore",                                       "Diet | Reference category = 0",
+  "presence_Seminivore1",                              "Seminivore",                                        "Diet | Reference category = 0"
+)
+
+# Fixed display order for the groups themselves (rows within each group
+# are then sorted by Estimate, descending)
+group_order <- c(
+  "Intercept",
+  "Random effects",
+  "Continuous variables",
+  "Regional endemism | Reference category = No",
+  "National endemism | Reference category = No",
+  "IUCN Status | Reference category = Least concern",
+  "Habitat use | Reference category = Terrestrial",
+  "Diet | Reference category = 0"
+)
+
+# Add "Overlapping 0?" and Direction columns
+
+add_overlap_direction <- function(tbl) {
+  tbl %>%
+    mutate(
+      `Overlapping 0?` = ifelse(`Lower 95% CI` <= 0 & `Upper 95% CI` >= 0, "Yes", "No"),
+      Direction = case_when(
+        `Overlapping 0?` == "Yes" ~ "None",
+        Estimate > 0 ~ "Positive",
+        TRUE ~ "Negative"
+      )
+    )
+}
+
+for (nm in names(models)) {
+  
+  fit <- models[[nm]]
+  summ <- summary(fit)
+  
+  fixed_tbl <- as.data.frame(summ$fixed) %>%
+    mutate(parameter = rownames(summ$fixed), effect = "fixed")
+  
+  random_tbl <- bind_rows(lapply(names(summ$random), function(g) {
+    as.data.frame(summ$random[[g]]) %>%
+      mutate(parameter = paste0(g, ": ", rownames(summ$random[[g]])), effect = "random")
+  }))
+  
+  full_tbl <- bind_rows(fixed_tbl, random_tbl) %>%
+    select(parameter, effect, Estimate, Est.Error,
+           `l-95% CI`, `u-95% CI`, Rhat, Bulk_ESS, Tail_ESS)
+  
+  # Full, raw-precision table, including the imputation submodels
+  
+  save_table(full_tbl, paste0("all_parameters_", nm), type = "additional")
+  
+  # Inclusion submodel only, relabelled, grouped and ordered (Tables S2 and S3)
+  
+  presence_only_tbl <- full_tbl %>%
+    filter(parameter %in% param_lookup$parameter) %>%
+    left_join(param_lookup, by = "parameter") %>%
+    mutate(group = factor(group, levels = group_order)) %>%
+    rename(
+      Parameter    = label,
+      SD           = Est.Error,
+      `Lower 95% CI` = `l-95% CI`,
+      `Upper 95% CI` = `u-95% CI`,
+      `R-hat`      = Rhat,
+      `Bulk ESS`   = Bulk_ESS,
+      `Tail ESS`   = Tail_ESS
+    ) %>%
+    add_overlap_direction() %>%
+    mutate(across(c(Estimate, SD, `Lower 95% CI`, `Upper 95% CI`), ~ round(.x, 3)),
+           `R-hat` = round(`R-hat`, 3),
+           across(c(`Bulk ESS`, `Tail ESS`), ~ round(.x))) %>%
+    # sort: group order first, then descending Estimate within each group
+    # (Intercept and Random effects rows keep their natural single/short order)
+    arrange(group, desc(Estimate)) %>%
+    select(group, Parameter, Estimate, SD, `Lower 95% CI`, `Upper 95% CI`,
+           `Overlapping 0?`, Direction, `R-hat`, `Bulk ESS`, `Tail ESS`)
+  
+  table_name <- c(Model_1 = "TableS2_model1_parameters", Model_2 = "TableS3_model2_parameters")[[nm]]
+  save_table(presence_only_tbl, table_name, type = "supplementary")
+}
+
+```
+
+**Model fit:**
+
+```{r}
+# Null model  
+loo_fit_0 <- loo(fit_0, cores = 4) 
+print(loo_fit_0) 
+```
+
+```{r}
+# Model 1: no taxonomy  
+loo_fit_1 <- loo(fit_1, resp = "presence", cores = 4) 
+print(loo_fit_1) 
+```
+
+```{r}
+# Model 2: with taxonomy  
+loo_fit_2 <- loo(fit_2, resp = "presence", cores = 4) 
+print(loo_fit_2) 
+```
+
+```{r}
+# Compare the models (difference in expected log predictive density)
+loo_compare(loo_fit_0, loo_fit_1, loo_fit_2)
+```
+
+Next, we will compare the R2 values of the models.
+
+```{r}
+
+# Compute Bayesian R2 using bayes_R2 function for each model 
+bayes_r2_1 <- bayes_R2(fit_1, resp = "presence") 
+bayes_r2_2 <- bayes_R2(fit_2, resp = "presence")     
+
+# Print the results for Bayesian R2 
+
+cat("Bayesian R2 for Model 1:", bayes_r2_1, "\n") 
+cat("Bayesian R2 for Model 2:", bayes_r2_2, "\n")   
+
+```
+
+**Statistics reported in the main text: model comparison and variance components**
+
+```{r}
+
+# Difference in LOOIC between Model 1 and Model 2 (LOOIC = -2 * elpd_loo)
+
+elpd_diff_12 <- loo_compare(loo_fit_1, loo_fit_2)
+delta_looic  <- 2 * abs(elpd_diff_12[2, "elpd_diff"])
+se_looic     <- 2 * elpd_diff_12[2, "se_diff"]
+
+cat(sprintf("Delta LOOIC (Model 1 vs Model 2): %.1f (SE = %.1f)\n", delta_looic, se_looic))
+cat(sprintf("Bayesian R2: %.1f%% (Model 2) vs %.1f%% (Model 1)\n",
+            bayes_r2_2[1, "Estimate"] * 100, bayes_r2_1[1, "Estimate"] * 100))
+
+# Standard deviations of the group-level effects in Model 2, and their ratio
+
+sd_phylogeny <- summary(fit_2)$random$binomial["sd(presence_Intercept)", ]
+sd_primer    <- summary(fit_2)$random$primer["sd(presence_Intercept)", ]
+
+cat(sprintf("Phylogenetic SD: %.2f (95%% CI: %.2f-%.2f); primer SD: %.2f (95%% CI: %.2f-%.2f); ratio: %.1f\n",
+            sd_phylogeny$Estimate, sd_phylogeny$`l-95% CI`, sd_phylogeny$`u-95% CI`,
+            sd_primer$Estimate, sd_primer$`l-95% CI`, sd_primer$`u-95% CI`,
+            sd_phylogeny$Estimate / sd_primer$Estimate))
+
+rm(elpd_diff_12, delta_looic, se_looic, sd_phylogeny, sd_primer)
+
+```
+
+**Marginal effects for continuous variables of model 1 and 2:**
+
+*Time since description - model 1:*
+
+```{r, fig.width = 7, fig.height = 4}
+
+
+font_add_google("Roboto Condensed", "roboto_condensed")
+showtext_auto()
+showtext_opts(dpi = 400)
+
+ce_95 <- conditional_effects(fit_1, effects = "time_since_description_scaled", 
+                             prob = 0.95, resolution = 100)
+plot_data_95 <- ce_95[["presence.presence_time_since_description_scaled"]]
+
+transform_time <- function(plot_data) {
+  original_vals <- as.numeric(brz_mam_completeness_traits_all$time_since_description)
+  original_vals_clean <- original_vals[!is.na(original_vals)]
+  mean_val <- mean(original_vals_clean)
+  sd_val <- sd(original_vals_clean)
+  plot_data$time_since_description <- plot_data$time_since_description_scaled * sd_val + mean_val
+  return(plot_data)
+}
+plot_data_95 <- transform_time(plot_data_95)
+
+model_summary_tsd1 <- summary(fit_1)$fixed
+presence_time_param_tsd1 <- "presence_time_since_description_scaled"
+
+if(presence_time_param_tsd1 %in% rownames(model_summary_tsd1)) {
+  param_row_tsd1 <- model_summary_tsd1[presence_time_param_tsd1, ]
+  lower_ci_tsd1 <- param_row_tsd1[["l-95% CI"]]
+  upper_ci_tsd1 <- param_row_tsd1[["u-95% CI"]]
+  effect_size_tsd1 <- param_row_tsd1[["Estimate"]]
+  
+  band_color_tsd1 <- if(lower_ci_tsd1 > 0 & upper_ci_tsd1 > 0) {
+    "#3182bd"
+  } else if(lower_ci_tsd1 < 0 & upper_ci_tsd1 < 0) {
+    "#de2d26"
+  } else {
+    "#969696"
+  }
+  
+  effect_text_tsd1 <- paste0("**Effect size:** ", round(effect_size_tsd1, 3), " [",
+                             round(lower_ci_tsd1, 3), " - ", round(upper_ci_tsd1, 3), "]")
+} else {
+  band_color_tsd1 <- "#969696"
+  effect_text_tsd1 <- "**Effect size:** Not available"
+}
+
+nc_theme <- theme_minimal(base_size = 14, base_family = "roboto_condensed") +
+  theme(
+    plot.title       = element_blank(),
+    axis.line        = element_line(colour = "black", linewidth = 0.4),
+    axis.ticks       = element_line(colour = "black", linewidth = 0.4),
+    panel.border     = element_blank(),
+    panel.background = element_blank(),
+    panel.grid       = element_blank(),
+    axis.text        = element_text(size = 16, colour = "black"),
+    axis.title.x     = element_text(size = 18, colour = "black", face = "bold",
+                                    margin = margin(t = 12)),
+    axis.title.y     = element_text(size = 18, colour = "black", face = "bold",
+                                    margin = margin(r = 12)),
+    plot.margin      = margin(12, 12, 12, 12)
+  )
+
+p_time_since_description_model_1 <- ggplot() +
+  geom_ribbon(data = plot_data_95, aes(x = time_since_description, ymin = lower__, ymax = upper__), 
+              fill = band_color_tsd1, alpha = 0.25) +
+  geom_line(data = plot_data_95, aes(x = time_since_description, y = lower__), 
+            colour = band_color_tsd1, linewidth = 0.3, alpha = 0.6) +
+  geom_line(data = plot_data_95, aes(x = time_since_description, y = upper__), 
+            colour = band_color_tsd1, linewidth = 0.3, alpha = 0.6) +
+  geom_line(data = plot_data_95, aes(x = time_since_description, y = estimate__),
+            linewidth = 0.8, colour = "black") +
+  scale_y_continuous(limits = c(0, 1)) +
+  scale_x_continuous(labels = scales::comma_format()) +
+  labs(x = "Time since description (years)", y = "Probability of inclusion") +
+  nc_theme +
+  geom_richtext(
+    aes(x = !!(min(plot_data_95$time_since_description) * 1.1), y = 0.95, label = !!effect_text_tsd1),
+    family = "roboto_condensed", size = 6, colour = "black", hjust = 0, vjust = 0,
+    fill = NA, label.color = NA, label.padding = unit(0, "pt")
+  )
+
+p_time_since_description_model_1
+
+
+save_figure(p_time_since_description_model_1, "Fig3a_time_since_description", width = 6, height = 4.5)
+
+# Statistics reported in the main text - result variables also uniquely named
+
+get_probability_at_time_tsd1 <- function(target_time) {
+  idx <- which.min(abs(plot_data_95$time_since_description - target_time))
+  return(c(
+    estimate = plot_data_95$estimate__[idx],
+    lower = plot_data_95$lower__[idx],
+    upper = plot_data_95$upper__[idx]
+  ))
+}
+
+prob_0yr_tsd1   <- get_probability_at_time_tsd1(0)
+prob_50yr_tsd1  <- get_probability_at_time_tsd1(50)
+prob_100yr_tsd1 <- get_probability_at_time_tsd1(100)
+prob_200yr_tsd1 <- get_probability_at_time_tsd1(200)
+prob_250yr_tsd1 <- get_probability_at_time_tsd1(250)
+
+change_50yr_tsd1  <- (prob_50yr_tsd1["estimate"]  - prob_0yr_tsd1["estimate"]) * 100
+change_100yr_tsd1 <- (prob_100yr_tsd1["estimate"] - prob_0yr_tsd1["estimate"]) * 100
+change_200yr_tsd1 <- (prob_200yr_tsd1["estimate"] - prob_0yr_tsd1["estimate"]) * 100
+change_250yr_tsd1 <- (prob_250yr_tsd1["estimate"] - prob_0yr_tsd1["estimate"]) * 100
+
+cat("\n=== TIME SINCE DESCRIPTION (Model 1) ===\n\n")
+cat(sprintf("Recently described (0 years): %.1f%% (95%% CI: %.1f–%.1f%%)\n",
+            prob_0yr_tsd1["estimate"]*100, prob_0yr_tsd1["lower"]*100, prob_0yr_tsd1["upper"]*100))
+cat(sprintf("Described 50 years ago: %.1f%% (95%% CI: %.1f–%.1f%%), +%.1f pp\n",
+            prob_50yr_tsd1["estimate"]*100, prob_50yr_tsd1["lower"]*100, prob_50yr_tsd1["upper"]*100, change_50yr_tsd1))
+cat(sprintf("Described 100 years ago: %.1f%% (95%% CI: %.1f–%.1f%%), +%.1f pp\n\n",
+            prob_100yr_tsd1["estimate"]*100, prob_100yr_tsd1["lower"]*100, prob_100yr_tsd1["upper"]*100, change_100yr_tsd1))
+cat(sprintf("Described 200 years ago: %.1f%% (95%% CI: %.1f–%.1f%%), +%.1f pp\n\n",
+            prob_200yr_tsd1["estimate"]*100, prob_200yr_tsd1["lower"]*100, prob_200yr_tsd1["upper"]*100, change_200yr_tsd1))
+cat(sprintf("Described 250 years ago: %.1f%% (95%% CI: %.1f–%.1f%%), +%.1f pp\n\n",
+            prob_250yr_tsd1["estimate"]*100, prob_250yr_tsd1["lower"]*100, prob_250yr_tsd1["upper"]*100, change_250yr_tsd1))
+
+```
+
+*Time since description - model 2:*
+
+```{r, fig.width = 7, fig.height = 4}
+
+ce_95 <- conditional_effects(fit_2, effects = "time_since_description_scaled", 
+                             prob = 0.95, resolution = 100)
+plot_data_95 <- ce_95[["presence.presence_time_since_description_scaled"]]
+plot_data_95 <- transform_time(plot_data_95)   # reuse function defined above
+
+model_summary_tsd2 <- summary(fit_2)$fixed
+presence_time_param_tsd2 <- "presence_time_since_description_scaled"
+
+if(presence_time_param_tsd2 %in% rownames(model_summary_tsd2)) {
+  param_row_tsd2 <- model_summary_tsd2[presence_time_param_tsd2, ]
+  lower_ci_tsd2 <- param_row_tsd2[["l-95% CI"]]
+  upper_ci_tsd2 <- param_row_tsd2[["u-95% CI"]]
+  effect_size_tsd2 <- param_row_tsd2[["Estimate"]]
+  
+  band_color_tsd2 <- if(lower_ci_tsd2 > 0 & upper_ci_tsd2 > 0) {
+    "#3182bd"
+  } else if(lower_ci_tsd2 < 0 & upper_ci_tsd2 < 0) {
+    "#de2d26"
+  } else {
+    "#969696"
+  }
+  
+  effect_text_tsd2 <- paste0("**Effect size:** ", round(effect_size_tsd2, 3), " [",
+                             round(lower_ci_tsd2, 3), " - ", round(upper_ci_tsd2, 3), "]")
+} else {
+  band_color_tsd2 <- "#969696"
+  effect_text_tsd2 <- "**Effect size:** Not available"
+}
+
+p_time_since_description_model_2 <- ggplot() +
+  geom_ribbon(data = plot_data_95, aes(x = time_since_description, ymin = lower__, ymax = upper__), 
+              fill = band_color_tsd2, alpha = 0.25) +
+  geom_line(data = plot_data_95, aes(x = time_since_description, y = lower__), 
+            colour = band_color_tsd2, linewidth = 0.3, alpha = 0.6) +
+  geom_line(data = plot_data_95, aes(x = time_since_description, y = upper__), 
+            colour = band_color_tsd2, linewidth = 0.3, alpha = 0.6) +
+  geom_line(data = plot_data_95, aes(x = time_since_description, y = estimate__),
+            linewidth = 0.8, colour = "black") +
+  scale_y_continuous(limits = c(0, 1)) +
+  scale_x_continuous(labels = scales::comma_format()) +
+  labs(x = "Time since description (years)", y = "Probability of inclusion") +
+  nc_theme +
+  geom_richtext(
+    aes(x = !!(min(plot_data_95$time_since_description) * 1.1), y = 0.95, label = !!effect_text_tsd2),
+    family = "roboto_condensed", size = 6, colour = "black", hjust = 0, vjust = 0,
+    fill = NA, label.color = NA, label.padding = unit(0, "pt")
+  )
+
+p_time_since_description_model_2
+
+save_figure(p_time_since_description_model_2, "FigS50b_time_since_description_model2", width = 6, height = 4.5, type = "supplementary")
+
+# Statistics reported in the main text
+
+get_probability_at_time_tsd2 <- function(target_time) {
+  idx <- which.min(abs(plot_data_95$time_since_description - target_time))
+  return(c(
+    estimate = plot_data_95$estimate__[idx],
+    lower = plot_data_95$lower__[idx],
+    upper = plot_data_95$upper__[idx]
+  ))
+}
+
+prob_0yr_tsd2   <- get_probability_at_time_tsd2(0)
+prob_50yr_tsd2  <- get_probability_at_time_tsd2(50)
+prob_100yr_tsd2 <- get_probability_at_time_tsd2(100)
+prob_200yr_tsd2 <- get_probability_at_time_tsd2(200)
+prob_250yr_tsd2 <- get_probability_at_time_tsd2(250)
+
+change_50yr_tsd2  <- (prob_50yr_tsd2["estimate"]  - prob_0yr_tsd2["estimate"]) * 100
+change_100yr_tsd2 <- (prob_100yr_tsd2["estimate"] - prob_0yr_tsd2["estimate"]) * 100
+change_200yr_tsd2 <- (prob_200yr_tsd2["estimate"] - prob_0yr_tsd2["estimate"]) * 100
+change_250yr_tsd2 <- (prob_250yr_tsd2["estimate"] - prob_0yr_tsd2["estimate"]) * 100
+
+cat("\n=== TIME SINCE DESCRIPTION (Model 2) ===\n\n")
+cat(sprintf("Recently described (0 years): %.1f%% (95%% CI: %.1f–%.1f%%)\n",
+            prob_0yr_tsd2["estimate"]*100, prob_0yr_tsd2["lower"]*100, prob_0yr_tsd2["upper"]*100))
+cat(sprintf("Described 50 years ago: %.1f%% (95%% CI: %.1f–%.1f%%), +%.1f pp\n",
+            prob_50yr_tsd2["estimate"]*100, prob_50yr_tsd2["lower"]*100, prob_50yr_tsd2["upper"]*100, change_50yr_tsd2))
+cat(sprintf("Described 100 years ago: %.1f%% (95%% CI: %.1f–%.1f%%), +%.1f pp\n\n",
+            prob_100yr_tsd2["estimate"]*100, prob_100yr_tsd2["lower"]*100, prob_100yr_tsd2["upper"]*100, change_100yr_tsd2))
+cat(sprintf("Described 200 years ago: %.1f%% (95%% CI: %.1f–%.1f%%), +%.1f pp\n\n",
+            prob_200yr_tsd2["estimate"]*100, prob_200yr_tsd2["lower"]*100, prob_200yr_tsd2["upper"]*100, change_200yr_tsd2))
+cat(sprintf("Described 250 years ago: %.1f%% (95%% CI: %.1f–%.1f%%), +%.1f pp\n\n",
+            prob_250yr_tsd2["estimate"]*100, prob_250yr_tsd2["lower"]*100, prob_250yr_tsd2["upper"]*100, change_250yr_tsd2))
+
+
+```
+
+*Body mass - model 1:*
+
+```{r,  fig.width = 7, fig.height = 4}
+
+ce_95 <- conditional_effects(fit_1, effects = "BodyMass_g_scaled", prob = 0.95, resolution = 100)
+plot_data_95 <- ce_95[["presence.presence_BodyMass_g_scaled"]]
+
+transform_bodymass <- function(plot_data) {
+  original_vals <- as.numeric(brz_mam_completeness_traits_all$BodyMass_g)
+  original_vals_clean <- original_vals[!is.na(original_vals)]
+  log_transformed <- log(original_vals_clean)
+  mean_val <- mean(log_transformed); sd_val <- sd(log_transformed)
+  unscaled_log <- plot_data$BodyMass_g_scaled * sd_val + mean_val
+  plot_data$BodyMass_g <- exp(unscaled_log)
+  return(plot_data)
+}
+plot_data_95 <- transform_bodymass(plot_data_95)
+
+model_summary_bm1 <- summary(fit_1)$fixed
+presence_bodymass_param_bm1 <- "presence_miBodyMass_g_scaled"
+
+if(presence_bodymass_param_bm1 %in% rownames(model_summary_bm1)) {
+  param_row_bm1 <- model_summary_bm1[presence_bodymass_param_bm1, ]
+  lower_ci_bm1 <- param_row_bm1[["l-95% CI"]]
+  upper_ci_bm1 <- param_row_bm1[["u-95% CI"]]
+  effect_size_bm1 <- param_row_bm1[["Estimate"]]
+  
+  band_color_bm1 <- if(lower_ci_bm1 > 0 & upper_ci_bm1 > 0) {
+    "#3182bd"
+  } else if(lower_ci_bm1 < 0 & upper_ci_bm1 < 0) {
+    "#de2d26"
+  } else {
+    "#969696"
+  }
+  
+  effect_text_bm1 <- paste0("**Effect size:** ", round(effect_size_bm1, 3), " [",
+                            round(lower_ci_bm1, 3), " - ", round(upper_ci_bm1, 3), "]")
+} else {
+  band_color_bm1 <- "#969696"
+  effect_text_bm1 <- "**Effect size:** Not available"
+}
+
+p_bodymass_model_1 <- ggplot() +
+  geom_ribbon(data = plot_data_95, aes(x = BodyMass_g, ymin = lower__, ymax = upper__), 
+              fill = band_color_bm1, alpha = 0.25) +
+  geom_line(data = plot_data_95, aes(x = BodyMass_g, y = lower__), 
+            colour = band_color_bm1, linewidth = 0.3, alpha = 0.6) +
+  geom_line(data = plot_data_95, aes(x = BodyMass_g, y = upper__), 
+            colour = band_color_bm1, linewidth = 0.3, alpha = 0.6) +
+  geom_line(data = plot_data_95, aes(x = BodyMass_g, y = estimate__),
+            linewidth = 0.8, colour = "black") +
+  scale_y_continuous(limits = c(0, 1)) +
+  scale_x_log10(labels = scales::comma_format()) +
+  labs(x = "Body mass (g)", y = "Probability of inclusion") +
+  nc_theme +
+  geom_richtext(
+    aes(x = !!(min(plot_data_95$BodyMass_g) * 1.1), y = 0.95, label = !!effect_text_bm1),
+    family = "roboto_condensed", size = 6, colour = "black", hjust = 0, vjust = 1,
+    fill = NA, label.color = NA, label.padding = unit(0, "pt")
+  )
+
+p_bodymass_model_1
+
+save_figure(p_bodymass_model_1, "Fig3c_body_mass", width = 6, height = 4.5)
+
+# Statistics reported in the main text
+
+get_probability_at_mass_bm1 <- function(target_mass_g) {
+  idx <- which.min(abs(plot_data_95$BodyMass_g - target_mass_g))
+  return(c(estimate = plot_data_95$estimate__[idx], lower = plot_data_95$lower__[idx], upper = plot_data_95$upper__[idx]))
+}
+
+masses_bm1 <- c(10, 1000, 100000, 300000)
+prob_small_bm1  <- get_probability_at_mass_bm1(masses_bm1[1])
+prob_medium_bm1 <- get_probability_at_mass_bm1(masses_bm1[2])
+prob_large_bm1  <- get_probability_at_mass_bm1(masses_bm1[3])
+prob_xlarge_bm1 <- get_probability_at_mass_bm1(masses_bm1[4])
+
+change_medium_bm1 <- (prob_medium_bm1["estimate"] - prob_small_bm1["estimate"]) * 100
+change_large_bm1  <- (prob_large_bm1["estimate"]  - prob_small_bm1["estimate"]) * 100
+change_xlarge_bm1 <- (prob_xlarge_bm1["estimate"] - prob_small_bm1["estimate"]) * 100
+
+cat("\n=== BODY MASS (Model 1) ===\n\n")
+cat(sprintf("Small species (~0.01 kg): %.1f%% (95%% CI: %.1f–%.1f%%)\n", prob_small_bm1["estimate"]*100, prob_small_bm1["lower"]*100, prob_small_bm1["upper"]*100))
+cat(sprintf("Medium (~1 kg): %.1f%% (95%% CI: %.1f–%.1f%%), %+0.1f pp\n", prob_medium_bm1["estimate"]*100, prob_medium_bm1["lower"]*100, prob_medium_bm1["upper"]*100, change_medium_bm1))
+cat(sprintf("Large (~100 kg): %.1f%% (95%% CI: %.1f–%.1f%%), %+0.1f pp\n", prob_large_bm1["estimate"]*100, prob_large_bm1["lower"]*100, prob_large_bm1["upper"]*100, change_large_bm1))
+cat(sprintf("Very large (~300 kg): %.1f%% (95%% CI: %.1f–%.1f%%), %+0.1f pp\n", prob_xlarge_bm1["estimate"]*100, prob_xlarge_bm1["lower"]*100, prob_xlarge_bm1["upper"]*100, change_xlarge_bm1))
+
+
+```
+
+*Body mass - model 2:*
+
+```{r,  fig.width = 7, fig.height = 4}
+
+ce_95 <- conditional_effects(fit_2, effects = "BodyMass_g_scaled", prob = 0.95, resolution = 100)
+plot_data_95 <- ce_95[["presence.presence_BodyMass_g_scaled"]]
+plot_data_95 <- transform_bodymass(plot_data_95)   # reuse the function defined above
+
+model_summary_bm2 <- summary(fit_2)$fixed
+presence_bodymass_param_bm2 <- "presence_miBodyMass_g_scaled"
+
+if(presence_bodymass_param_bm2 %in% rownames(model_summary_bm2)) {
+  param_row_bm2 <- model_summary_bm2[presence_bodymass_param_bm2, ]
+  lower_ci_bm2 <- param_row_bm2[["l-95% CI"]]
+  upper_ci_bm2 <- param_row_bm2[["u-95% CI"]]
+  effect_size_bm2 <- param_row_bm2[["Estimate"]]
+  
+  band_color_bm2 <- if(lower_ci_bm2 > 0 & upper_ci_bm2 > 0) {
+    "#3182bd"
+  } else if(lower_ci_bm2 < 0 & upper_ci_bm2 < 0) {
+    "#de2d26"
+  } else {
+    "#969696"
+  }
+  
+  effect_text_bm2 <- paste0("**Effect size:** ", round(effect_size_bm2, 3), " [",
+                            round(lower_ci_bm2, 3), " - ", round(upper_ci_bm2, 3), "]")
+} else {
+  band_color_bm2 <- "#969696"
+  effect_text_bm2 <- "**Effect size:** Not available"
+}
+
+p_bodymass_model_2 <- ggplot() +
+  geom_ribbon(data = plot_data_95, aes(x = BodyMass_g, ymin = lower__, ymax = upper__), 
+              fill = band_color_bm2, alpha = 0.25) +
+  geom_line(data = plot_data_95, aes(x = BodyMass_g, y = lower__), 
+            colour = band_color_bm2, linewidth = 0.3, alpha = 0.6) +
+  geom_line(data = plot_data_95, aes(x = BodyMass_g, y = upper__), 
+            colour = band_color_bm2, linewidth = 0.3, alpha = 0.6) +
+  geom_line(data = plot_data_95, aes(x = BodyMass_g, y = estimate__),
+            linewidth = 0.8, colour = "black") +
+  scale_y_continuous(limits = c(0, 1)) +
+  scale_x_log10(labels = scales::comma_format()) +
+  labs(x = "Body mass (g)", y = "Probability of inclusion") +
+  nc_theme +
+  geom_richtext(
+    aes(x = !!(min(plot_data_95$BodyMass_g) * 1.1), y = 0.95, label = !!effect_text_bm2),
+    family = "roboto_condensed", size = 6, colour = "black", hjust = 0, vjust = 1,
+    fill = NA, label.color = NA, label.padding = unit(0, "pt")
+  )
+
+p_bodymass_model_2
+
+# Body mass remains credibly positive in Model 2 (95% CI excludes zero) but is
+# not shown in Fig. S50; saved as a candidate panel f
+save_figure(p_bodymass_model_2, "FigS50f_body_mass_model2", width = 6, height = 4.5, type = "supplementary")
+
+# Statistics reported in the main text
+
+get_probability_at_mass_bm2 <- function(target_mass_g) {
+  idx <- which.min(abs(plot_data_95$BodyMass_g - target_mass_g))
+  return(c(estimate = plot_data_95$estimate__[idx], lower = plot_data_95$lower__[idx], upper = plot_data_95$upper__[idx]))
+}
+
+masses_bm2 <- c(10, 1000, 100000, 300000)
+prob_small_bm2  <- get_probability_at_mass_bm2(masses_bm2[1])
+prob_medium_bm2 <- get_probability_at_mass_bm2(masses_bm2[2])
+prob_large_bm2  <- get_probability_at_mass_bm2(masses_bm2[3])
+prob_xlarge_bm2 <- get_probability_at_mass_bm2(masses_bm2[4])
+
+change_medium_bm2 <- (prob_medium_bm2["estimate"] - prob_small_bm2["estimate"]) * 100
+change_large_bm2  <- (prob_large_bm2["estimate"]  - prob_small_bm2["estimate"]) * 100
+change_xlarge_bm2 <- (prob_xlarge_bm2["estimate"] - prob_small_bm2["estimate"]) * 100
+
+cat("\n=== BODY MASS (Model 2) ===\n\n")
+cat(sprintf("Small species (~0.01 kg): %.1f%% (95%% CI: %.1f–%.1f%%)\n", prob_small_bm2["estimate"]*100, prob_small_bm2["lower"]*100, prob_small_bm2["upper"]*100))
+cat(sprintf("Medium (~1 kg): %.1f%% (95%% CI: %.1f–%.1f%%), %+0.1f pp\n", prob_medium_bm2["estimate"]*100, prob_medium_bm2["lower"]*100, prob_medium_bm2["upper"]*100, change_medium_bm2))
+cat(sprintf("Large (~100 kg): %.1f%% (95%% CI: %.1f–%.1f%%), %+0.1f pp\n", prob_large_bm2["estimate"]*100, prob_large_bm2["lower"]*100, prob_large_bm2["upper"]*100, change_large_bm2))
+cat(sprintf("Very large (~300 kg): %.1f%% (95%% CI: %.1f–%.1f%%), %+0.1f pp\n", prob_xlarge_bm2["estimate"]*100, prob_xlarge_bm2["lower"]*100, prob_xlarge_bm2["upper"]*100, change_xlarge_bm2))
+```
+
+*Range size - model 1:*
+
+```{r, fig.width = 7, fig.height = 4}
+
+ce_95 <- conditional_effects(fit_1, effects = "RangeSize_scaled", prob = 0.95, resolution = 100)
+plot_data_95 <- ce_95[["presence.presence_RangeSize_scaled"]]
+
+transform_rangesize <- function(plot_data) {
+  original_vals <- as.numeric(brz_mam_completeness_traits_all$RangeSize)
+  original_vals_clean <- original_vals[!is.na(original_vals)]
+  log_transformed <- log(original_vals_clean)
+  mean_val <- mean(log_transformed); sd_val <- sd(log_transformed)
+  unscaled_log <- plot_data$RangeSize_scaled * sd_val + mean_val
+  plot_data$RangeSize <- exp(unscaled_log) * 12100  # 110 km x 110 km
+  return(plot_data)
+}
+plot_data_95 <- transform_rangesize(plot_data_95)
+
+model_summary <- summary(fit_1)$fixed
+presence_rangesize_param <- "presence_miRangeSize_scaled"
+
+if(presence_rangesize_param %in% rownames(model_summary)) {
+  param_row <- model_summary[presence_rangesize_param, ]
+  lower_ci <- param_row[["l-95% CI"]]; upper_ci <- param_row[["u-95% CI"]]; effect_size <- param_row[["Estimate"]]
+  band_color <- if(lower_ci > 0 & upper_ci > 0) "#3182bd" else if(lower_ci < 0 & upper_ci < 0) "#de2d26" else "#969696"
+  effect_text <- paste0("**Effect size:** ", round(effect_size, 3), " [", round(lower_ci, 3), " - ", round(upper_ci, 3), "]")
+} else {
+  band_color <- "#969696"; effect_text <- "**Effect size:** Not available"
+}
+
+p_rangesize_model_1 <- ggplot() +
+  geom_ribbon(data = plot_data_95, aes(x = RangeSize, ymin = lower__, ymax = upper__), 
+              fill = band_color, alpha = 0.25) +
+  geom_line(data = plot_data_95, aes(x = RangeSize, y = lower__), 
+            colour = band_color, linewidth = 0.3, alpha = 0.6) +
+  geom_line(data = plot_data_95, aes(x = RangeSize, y = upper__), 
+            colour = band_color, linewidth = 0.3, alpha = 0.6) +
+  geom_line(data = plot_data_95, aes(x = RangeSize, y = estimate__),
+            linewidth = 0.8, colour = "black") +
+  scale_y_continuous(limits = c(0, 1)) +
+  scale_x_log10(labels = scales::comma_format()) +
+  labs(x = "Range size (km²)", y = "Probability of inclusion") +
+  nc_theme +
+  geom_richtext(
+    aes(x = !!(min(plot_data_95$RangeSize) * 1.1), y = 0.95, label = !!effect_text),
+    family = "roboto_condensed", size = 6, colour = "black", hjust = 0, vjust = 0,
+    fill = NA, label.color = NA, label.padding = unit(0, "pt")
+  )
+
+p_rangesize_model_1
+
+save_figure(p_rangesize_model_1, "Fig3b_range_size", width = 6, height = 4.5)
+
+# Statistics reported in the main text:
+
+get_probability_at_range <- function(target_km2) {
+  idx <- which.min(abs(plot_data_95$RangeSize - target_km2))
+  return(c(estimate = plot_data_95$estimate__[idx], lower = plot_data_95$lower__[idx], upper = plot_data_95$upper__[idx]))
+}
+
+ranges <- c(1e4, 1e5, 1e6, 1e7)
+prob_small  <- get_probability_at_range(ranges[1])
+prob_medium <- get_probability_at_range(ranges[2])
+prob_large  <- get_probability_at_range(ranges[3])
+prob_xlarge <- get_probability_at_range(ranges[4])
+
+change_medium <- (prob_medium["estimate"] - prob_small["estimate"]) * 100
+change_large  <- (prob_large["estimate"]  - prob_small["estimate"]) * 100
+change_xlarge <- (prob_xlarge["estimate"] - prob_small["estimate"]) * 100
+
+cat("\n=== RANGE SIZE (Model 1) ===\n\n")
+cat(sprintf("Small species (~1 × 10⁴ km²): %.1f%% (95%% CI: %.1f–%.1f%%)\n", prob_small["estimate"]*100, prob_small["lower"]*100, prob_small["upper"]*100))
+cat(sprintf("Medium (~1 × 10⁵ km²): %.1f%% (95%% CI: %.1f–%.1f%%), %+0.1f pp\n", prob_medium["estimate"]*100, prob_medium["lower"]*100, prob_medium["upper"]*100, change_medium))
+cat(sprintf("Large (~1 × 10⁶ km²): %.1f%% (95%% CI: %.1f–%.1f%%), %+0.1f pp\n", prob_large["estimate"]*100, prob_large["lower"]*100, prob_large["upper"]*100, change_large))
+cat(sprintf("Very large (~1 × 10⁷ km²): %.1f%% (95%% CI: %.1f–%.1f%%), %+0.1f pp\n", prob_xlarge["estimate"]*100, prob_xlarge["lower"]*100, prob_xlarge["upper"]*100, change_xlarge))
+
+```
+
+*Range size - model 2:*
+
+```{r, fig.width = 7, fig.height = 4}
+
+ce_95 <- conditional_effects(fit_2, effects = "RangeSize_scaled", prob = 0.95, resolution = 100)
+plot_data_95 <- ce_95[["presence.presence_RangeSize_scaled"]]
+plot_data_95 <- transform_rangesize(plot_data_95)  # reuse function defined above
+
+model_summary <- summary(fit_2)$fixed
+presence_rangesize_param <- "presence_miRangeSize_scaled"
+
+if(presence_rangesize_param %in% rownames(model_summary)) {
+  param_row <- model_summary[presence_rangesize_param, ]
+  lower_ci <- param_row[["l-95% CI"]]; upper_ci <- param_row[["u-95% CI"]]; effect_size <- param_row[["Estimate"]]
+  band_color <- if(lower_ci > 0 & upper_ci > 0) "#3182bd" else if(lower_ci < 0 & upper_ci < 0) "#de2d26" else "#969696"
+  effect_text <- paste0("**Effect size:** ", round(effect_size, 3), " [", round(lower_ci, 3), " - ", round(upper_ci, 3), "]")
+} else {
+  band_color <- "#969696"; effect_text <- "**Effect size:** Not available"
+}
+
+p_rangesize_model_2 <- ggplot() +
+  geom_ribbon(data = plot_data_95, aes(x = RangeSize, ymin = lower__, ymax = upper__), 
+              fill = band_color, alpha = 0.25) +
+  geom_line(data = plot_data_95, aes(x = RangeSize, y = lower__), 
+            colour = band_color, linewidth = 0.3, alpha = 0.6) +
+  geom_line(data = plot_data_95, aes(x = RangeSize, y = upper__), 
+            colour = band_color, linewidth = 0.3, alpha = 0.6) +
+  geom_line(data = plot_data_95, aes(x = RangeSize, y = estimate__),
+            linewidth = 0.8, colour = "black") +
+  scale_y_continuous(limits = c(0, 1)) +
+  scale_x_log10(labels = scales::comma_format()) +
+  labs(x = "Range size (km²)", y = "Probability of inclusion") +
+  nc_theme +
+  geom_richtext(
+    aes(x = !!(min(plot_data_95$RangeSize) * 1.1), y = 0.95, label = !!effect_text),
+    family = "roboto_condensed", size = 6, colour = "black", hjust = 0, vjust = 0,
+    fill = NA, label.color = NA, label.padding = unit(0, "pt")
+  )
+
+p_rangesize_model_2
+
+save_figure(p_rangesize_model_2, "FigS50a_range_size_model2", width = 6, height = 4.5, type = "supplementary")
+
+# Statistics reported in the main text:
+
+prob_small  <- get_probability_at_range(ranges[1])
+prob_medium <- get_probability_at_range(ranges[2])
+prob_large  <- get_probability_at_range(ranges[3])
+prob_xlarge <- get_probability_at_range(ranges[4])
+
+change_medium <- (prob_medium["estimate"] - prob_small["estimate"]) * 100
+change_large  <- (prob_large["estimate"]  - prob_small["estimate"]) * 100
+change_xlarge <- (prob_xlarge["estimate"] - prob_small["estimate"]) * 100
+
+cat("\n=== RANGE SIZE (Model 2) ===\n\n")
+cat(sprintf("Small species (~1 × 10⁴ km²): %.1f%% (95%% CI: %.1f–%.1f%%)\n", prob_small["estimate"]*100, prob_small["lower"]*100, prob_small["upper"]*100))
+cat(sprintf("Medium (~1 × 10⁵ km²): %.1f%% (95%% CI: %.1f–%.1f%%), %+0.1f pp\n", prob_medium["estimate"]*100, prob_medium["lower"]*100, prob_medium["upper"]*100, change_medium))
+cat(sprintf("Large (~1 × 10⁶ km²): %.1f%% (95%% CI: %.1f–%.1f%%), %+0.1f pp\n", prob_large["estimate"]*100, prob_large["lower"]*100, prob_large["upper"]*100, change_large))
+cat(sprintf("Very large (~1 × 10⁷ km²): %.1f%% (95%% CI: %.1f–%.1f%%), %+0.1f pp\n", prob_xlarge["estimate"]*100, prob_xlarge["lower"]*100, prob_xlarge["upper"]*100, change_xlarge))
+
+
+```
+
+Remove unneeded objects:
+
+```{r}
+
+# The Model 1 panels are kept for the Figure 3 composite below
+
+rm(p_time_since_description_model_2)
+rm(p_bodymass_model_2)
+rm(p_rangesize_model_2)
+rm(model_summary)
+
+rm(ce_95)
+
+rm(plot_data_95)
+
+rm(transform_time)
+rm(transform_bodymass)
+rm(transform_rangesize)
+
+rm(param_row)
+rm(lower_ci)
+rm(upper_ci)
+rm(effect_size)
+rm(effect_text)
+
+```
+
+**Marginal effects for categorical variables:**
+
+*Locomotion- model 1:*
+
+```{r}
+
+
+ce_locomotion <- conditional_effects(fit_1, effects = "locomotion", prob = 0.95)
+plot_data_locomotion <- ce_locomotion[["presence.presence_locomotion"]]
+
+model_summary_loc1 <- summary(fit_1)$fixed
+locomotion_params_loc1 <- model_summary_loc1[grepl("presence_locomotion", rownames(model_summary_loc1)), ]
+
+locomotion_params_loc1$locomotion <- gsub("presence_locomotion", "", rownames(locomotion_params_loc1))
+locomotion_params_loc1$color <- ifelse(locomotion_params_loc1[["l-95% CI"]] > 0, "#3182bd",
+                                       ifelse(locomotion_params_loc1[["u-95% CI"]] < 0, "#de2d26", "#969696"))
+
+locomotion_params_loc1$effect_text <- paste0(round(locomotion_params_loc1$Estimate, 3), 
+                                             " [", round(locomotion_params_loc1[["l-95% CI"]], 3), 
+                                             ", ", round(locomotion_params_loc1[["u-95% CI"]], 3), "]")
+
+reference_level_loc1 <- levels(plot_data_locomotion$locomotion)[1]
+locomotion_colors_loc1 <- rbind(
+  data.frame(locomotion = reference_level_loc1, color = "black", effect_text = "**Reference level**"),
+  locomotion_params_loc1[, c("locomotion", "color", "effect_text")]
+)
+
+plot_data_locomotion <- merge(plot_data_locomotion, locomotion_colors_loc1, by = "locomotion", all.x = TRUE)
+plot_data_locomotion <- plot_data_locomotion %>% arrange(estimate__)
+plot_data_locomotion$locomotion <- factor(plot_data_locomotion$locomotion, levels = unique(plot_data_locomotion$locomotion))
+plot_data_locomotion$text_x <- plot_data_locomotion$upper__ + 0.02
+
+nc_theme_forest <- theme_minimal(base_size = 14, base_family = "roboto_condensed") +
+  theme(
+    plot.title       = element_blank(),
+    axis.line.x      = element_line(colour = "black", linewidth = 0.4),
+    axis.line.y      = element_blank(),
+    axis.ticks.x     = element_line(colour = "black", linewidth = 0.4),
+    axis.ticks.y     = element_blank(),
+    panel.border     = element_blank(),
+    panel.background = element_blank(),
+    panel.grid       = element_blank(),
+    axis.text        = element_text(size = 16, colour = "black"),
+    axis.title.x     = element_text(size = 18, colour = "black", face = "bold", margin = margin(t = 12)),
+    axis.title.y     = element_blank(),
+    plot.margin      = margin(12, 24, 12, 12)
+  )
+
+p_locomotion_model_1 <- ggplot(plot_data_locomotion, aes(y = locomotion)) +
+  geom_point(aes(x = estimate__, color = color), size = 3) +
+  geom_errorbarh(aes(xmin = lower__, xmax = upper__, color = color), 
+                 height = 0.2, linewidth = 0.7) +
+  geom_richtext(
+    aes(x = text_x, label = effect_text, color = color),
+    hjust = 0, size = 6, family = "roboto_condensed",
+    fill = NA, label.color = NA, label.padding = unit(0, "pt")
+  ) +
+  scale_color_identity() +
+  scale_x_continuous(limits = c(0, 1.00), breaks = seq(0, 1, by = 0.25)) +
+  labs(x = "Probability of inclusion", y = "") +
+  nc_theme_forest +
+  scale_y_discrete(labels = c(
+    "Aq" = "Aquatic",
+    "SA" = "Semi-aquatic",
+    "Te" = "Terrestrial",
+    "SF" = "Semi-fossorial",
+    "Vo" = "Volant",
+    "Sc" = "Scansorial",
+    "Fs" = "Fossorial",
+    "Ar" = "Arboreal"
+  ))
+
+p_locomotion_model_1
+
+save_figure(p_locomotion_model_1, "Fig3d_locomotion", width = 9, height = 6)
+
+# Statistics reported in the main text
+
+ref_level_loc1 <- "Te"
+strongest_positive_loc1 <- "Vo"
+strongest_negative_loc1 <- "Aq"
+
+get_prob_loc1 <- function(category) {
+  idx <- which(plot_data_locomotion$locomotion == category)
+  return(c(estimate = plot_data_locomotion$estimate__[idx], lower = plot_data_locomotion$lower__[idx], upper = plot_data_locomotion$upper__[idx]))
+}
+
+prob_ref_loc1      <- get_prob_loc1(ref_level_loc1)
+prob_positive_loc1 <- get_prob_loc1(strongest_positive_loc1)
+prob_negative_loc1 <- get_prob_loc1(strongest_negative_loc1)
+
+change_positive_loc1 <- (prob_positive_loc1["estimate"] - prob_ref_loc1["estimate"]) * 100
+change_negative_loc1 <- (prob_negative_loc1["estimate"] - prob_ref_loc1["estimate"]) * 100
+
+cat("\n=== HABITAT USE (Model 1) ===\n\n")
+cat(sprintf("%s (reference): %.1f%% (95%% CI: %.1f–%.1f%%)\n",
+            ref_level_loc1, prob_ref_loc1["estimate"]*100, prob_ref_loc1["lower"]*100, prob_ref_loc1["upper"]*100))
+cat(sprintf("%s: %.1f%% (95%% CI: %.1f–%.1f%%), %+0.1f pp vs. %s\n",
+            strongest_positive_loc1, prob_positive_loc1["estimate"]*100, prob_positive_loc1["lower"]*100, prob_positive_loc1["upper"]*100, change_positive_loc1, ref_level_loc1))
+cat(sprintf("%s: %.1f%% (95%% CI: %.1f–%.1f%%), %+0.1f pp vs. %s\n",
+            strongest_negative_loc1, prob_negative_loc1["estimate"]*100, prob_negative_loc1["lower"]*100, prob_negative_loc1["upper"]*100, change_negative_loc1, ref_level_loc1))
+
+```
+
+*Habitat use - model 2:*
+
+```{r}
+
+ce_locomotion <- conditional_effects(fit_2, effects = "locomotion", prob = 0.95)
+plot_data_locomotion <- ce_locomotion[["presence.presence_locomotion"]]
+
+model_summary_loc2 <- summary(fit_2)$fixed
+locomotion_params_loc2 <- model_summary_loc2[grepl("presence_locomotion", rownames(model_summary_loc2)), ]
+
+locomotion_params_loc2$locomotion <- gsub("presence_locomotion", "", rownames(locomotion_params_loc2))
+locomotion_params_loc2$color <- ifelse(locomotion_params_loc2[["l-95% CI"]] > 0, "#3182bd",
+                                       ifelse(locomotion_params_loc2[["u-95% CI"]] < 0, "#de2d26", "#969696"))
+
+locomotion_params_loc2$effect_text <- paste0(round(locomotion_params_loc2$Estimate, 3), 
+                                             " [", round(locomotion_params_loc2[["l-95% CI"]], 3), 
+                                             ", ", round(locomotion_params_loc2[["u-95% CI"]], 3), "]")
+
+reference_level_loc2 <- levels(plot_data_locomotion$locomotion)[1]
+locomotion_colors_loc2 <- rbind(
+  data.frame(locomotion = reference_level_loc2, color = "black", effect_text = "**Reference level**"),
+  locomotion_params_loc2[, c("locomotion", "color", "effect_text")]
+)
+
+plot_data_locomotion <- merge(plot_data_locomotion, locomotion_colors_loc2, by = "locomotion", all.x = TRUE)
+plot_data_locomotion <- plot_data_locomotion %>% arrange(estimate__)
+plot_data_locomotion$locomotion <- factor(plot_data_locomotion$locomotion, levels = unique(plot_data_locomotion$locomotion))
+plot_data_locomotion$text_x <- plot_data_locomotion$upper__ + 0.02
+
+p_locomotion_model_2 <- ggplot(plot_data_locomotion, aes(y = locomotion)) +
+  geom_point(aes(x = estimate__, color = color), size = 3) +
+  geom_errorbarh(aes(xmin = lower__, xmax = upper__, color = color), height = 0.2, linewidth = 0.7) +
+  geom_richtext(
+    aes(x = text_x, label = effect_text, color = color),
+    hjust = 0, size = 6, family = "roboto_condensed",
+    fill = NA, label.color = NA, label.padding = unit(0, "pt")
+  ) +
+  scale_color_identity() +
+  scale_x_continuous(limits = c(0, 1.35), breaks = seq(0, 1, by = 0.25)) +
+  labs(x = "Probability of inclusion", y = "") +
+  nc_theme_forest +
+  scale_y_discrete(labels = c(
+    "Aq" = "Aquatic", "SA" = "Semi-aquatic", "Te" = "Terrestrial", "SF" = "Semi-fossorial",
+    "Vo" = "Volant", "Sc" = "Scansorial", "Fs" = "Fossorial", "Ar" = "Arboreal"
+  ))
+
+p_locomotion_model_2
+
+
+# Statistics reported in the main text
+
+ref_level_loc2 <- "Te"
+strongest_positive_loc2 <- "Vo"
+strongest_negative_loc2 <- "Aq"
+
+get_prob_loc2 <- function(category) {
+  idx <- which(plot_data_locomotion$locomotion == category)
+  return(c(estimate = plot_data_locomotion$estimate__[idx], lower = plot_data_locomotion$lower__[idx], upper = plot_data_locomotion$upper__[idx]))
+}
+
+prob_ref_loc2      <- get_prob_loc2(ref_level_loc2)
+prob_positive_loc2 <- get_prob_loc2(strongest_positive_loc2)
+prob_negative_loc2 <- get_prob_loc2(strongest_negative_loc2)
+
+change_positive_loc2 <- (prob_positive_loc2["estimate"] - prob_ref_loc2["estimate"]) * 100
+change_negative_loc2 <- (prob_negative_loc2["estimate"] - prob_ref_loc2["estimate"]) * 100
+
+cat("\n=== HABITAT USE (Model 2) ===\n\n")
+cat(sprintf("%s (reference): %.1f%% (95%% CI: %.1f–%.1f%%)\n",
+            ref_level_loc2, prob_ref_loc2["estimate"]*100, prob_ref_loc2["lower"]*100, prob_ref_loc2["upper"]*100))
+cat(sprintf("%s: %.1f%% (95%% CI: %.1f–%.1f%%), %+0.1f pp vs. %s\n",
+            strongest_positive_loc2, prob_positive_loc2["estimate"]*100, prob_positive_loc2["lower"]*100, prob_positive_loc2["upper"]*100, change_positive_loc2, ref_level_loc2))
+cat(sprintf("%s: %.1f%% (95%% CI: %.1f–%.1f%%), %+0.1f pp vs. %s\n",
+            strongest_negative_loc2, prob_negative_loc2["estimate"]*100, prob_negative_loc2["lower"]*100, prob_negative_loc2["upper"]*100, change_negative_loc2, ref_level_loc2))
+
+```
+
+*Conservation status - model 1:*
+
+```{r}
+ce_iucn_status <- conditional_effects(fit_1, effects = "iucn_status", prob = 0.95)
+plot_data_iucn_status <- ce_iucn_status[["presence.presence_iucn_status"]]
+
+model_summary_iucn1 <- summary(fit_1)$fixed
+iucn_status_params_iucn1 <- model_summary_iucn1[grepl("presence_iucn_status", rownames(model_summary_iucn1)), ]
+
+iucn_status_params_iucn1$iucn_status <- gsub("presence_iucn_status", "", rownames(iucn_status_params_iucn1))
+iucn_status_params_iucn1$color <- ifelse(iucn_status_params_iucn1[["l-95% CI"]] > 0, "#3182bd",
+                                         ifelse(iucn_status_params_iucn1[["u-95% CI"]] < 0, "#de2d26", "#969696"))
+
+iucn_status_params_iucn1$effect_text <- paste0(round(iucn_status_params_iucn1$Estimate, 3), 
+                                               " [", round(iucn_status_params_iucn1[["l-95% CI"]], 3), 
+                                               ", ", round(iucn_status_params_iucn1[["u-95% CI"]], 3), "]")
+
+reference_level_iucn1 <- levels(plot_data_iucn_status$iucn_status)[1]
+iucn_status_colors_iucn1 <- rbind(
+  data.frame(iucn_status = reference_level_iucn1, color = "black", effect_text = "**Reference level**"),
+  iucn_status_params_iucn1[, c("iucn_status", "color", "effect_text")]
+)
+
+plot_data_iucn_status <- merge(plot_data_iucn_status, iucn_status_colors_iucn1, by = "iucn_status", all.x = TRUE)
+plot_data_iucn_status <- plot_data_iucn_status %>% arrange(estimate__)
+plot_data_iucn_status$iucn_status <- factor(plot_data_iucn_status$iucn_status, levels = unique(plot_data_iucn_status$iucn_status))
+plot_data_iucn_status$text_x <- plot_data_iucn_status$upper__ + 0.02
+
+# nc_theme_forest_wrap <- nc_theme_forest +
+#   theme(axis.text.y = element_text(size = 13, colour = "black", lineheight = 0.8))
+
+p_iucn_status_model_1 <- ggplot(plot_data_iucn_status, aes(y = iucn_status)) +
+  geom_point(aes(x = estimate__, color = color), size = 3) +
+  geom_errorbarh(aes(xmin = lower__, xmax = upper__, color = color), height = 0.2, linewidth = 0.7) +
+  geom_richtext(
+    aes(x = text_x, label = effect_text, color = color),
+    hjust = 0, size = 6, family = "roboto_condensed",
+    fill = NA, label.color = NA, label.padding = unit(0, "pt")
+  ) +
+  scale_color_identity() +
+  scale_x_continuous(limits = c(0, 1.05), breaks = seq(0, 1, by = 0.25)) +
+  labs(x = "Probability of inclusion", y = "") +
+  nc_theme_forest +
+  theme(aspect.ratio = 1) +
+  scale_y_discrete(labels = c(
+    "LC" = "Least concern", "NT" = "Near-\nthreatened", "VU" = "Vulnerable",
+    "CR" = "Critically\nendangered", "DD" = "Data deficient", "EN" = "Endangered",
+    "UA" = "Unassessed", "EX" = "Extinct"
+  ))
+
+p_iucn_status_model_1
+
+save_figure(p_iucn_status_model_1, "Fig3e_iucn_status", width = 9, height = 6)
+
+# Statistics reported in the main text
+
+ref_level_iucn1 <- "LC"   
+strongest_negative_iucn1 <- "UA"  
+
+get_prob_iucn1 <- function(category) {
+  idx <- which(plot_data_iucn_status$iucn_status == category)
+  return(c(estimate = plot_data_iucn_status$estimate__[idx], lower = plot_data_iucn_status$lower__[idx], upper = plot_data_iucn_status$upper__[idx]))
+}
+
+prob_ref_iucn1      <- get_prob_iucn1(ref_level_iucn1)
+prob_negative_iucn1 <- get_prob_iucn1(strongest_negative_iucn1)
+
+change_negative_iucn1 <- (prob_negative_iucn1["estimate"] - prob_ref_iucn1["estimate"]) * 100
+
+cat("\n=== IUCN STATUS (Model 1) ===\n\n")
+cat(sprintf("%s (reference): %.1f%% (95%% CI: %.1f–%.1f%%)\n", ref_level_iucn1, prob_ref_iucn1["estimate"]*100, prob_ref_iucn1["lower"]*100, prob_ref_iucn1["upper"]*100))
+cat(sprintf("%s: %.1f%% (95%% CI: %.1f–%.1f%%), %+0.1f pp vs. %s\n", strongest_negative_iucn1, prob_negative_iucn1["estimate"]*100, prob_negative_iucn1["lower"]*100, prob_negative_iucn1["upper"]*100, change_negative_iucn1, ref_level_iucn1))
+
+
+```
+
+*Conservation status - model 2*
+
+```{r}
+
+ce_iucn_status <- conditional_effects(fit_2, effects = "iucn_status", prob = 0.95)
+plot_data_iucn_status <- ce_iucn_status[["presence.presence_iucn_status"]]
+
+model_summary_iucn2 <- summary(fit_2)$fixed
+iucn_status_params_iucn2 <- model_summary_iucn2[grepl("presence_iucn_status", rownames(model_summary_iucn2)), ]
+
+iucn_status_params_iucn2$iucn_status <- gsub("presence_iucn_status", "", rownames(iucn_status_params_iucn2))
+iucn_status_params_iucn2$color <- ifelse(iucn_status_params_iucn2[["l-95% CI"]] > 0, "#3182bd",
+                                         ifelse(iucn_status_params_iucn2[["u-95% CI"]] < 0, "#de2d26", "#969696"))
+
+iucn_status_params_iucn2$effect_text <- paste0(round(iucn_status_params_iucn2$Estimate, 3), 
+                                               " [", round(iucn_status_params_iucn2[["l-95% CI"]], 3), 
+                                               ", ", round(iucn_status_params_iucn2[["u-95% CI"]], 3), "]")
+
+reference_level_iucn2 <- levels(plot_data_iucn_status$iucn_status)[1]
+iucn_status_colors_iucn2 <- rbind(
+  data.frame(iucn_status = reference_level_iucn2, color = "black", effect_text = "**Reference level**"),
+  iucn_status_params_iucn2[, c("iucn_status", "color", "effect_text")]
+)
+
+plot_data_iucn_status <- merge(plot_data_iucn_status, iucn_status_colors_iucn2, by = "iucn_status", all.x = TRUE)
+plot_data_iucn_status <- plot_data_iucn_status %>% arrange(estimate__)
+plot_data_iucn_status$iucn_status <- factor(plot_data_iucn_status$iucn_status, levels = unique(plot_data_iucn_status$iucn_status))
+plot_data_iucn_status$text_x <- plot_data_iucn_status$upper__ + 0.02
+
+p_iucn_status_model_2 <- ggplot(plot_data_iucn_status, aes(y = iucn_status)) +
+  geom_point(aes(x = estimate__, color = color), size = 3) +
+  geom_errorbarh(aes(xmin = lower__, xmax = upper__, color = color), height = 0.2, linewidth = 0.7) +
+  geom_richtext(
+    aes(x = text_x, label = effect_text, color = color),
+    hjust = 0, size = 6, family = "roboto_condensed",
+    fill = NA, label.color = NA, label.padding = unit(0, "pt")
+  ) +
+  scale_color_identity() +
+  scale_x_continuous(limits = c(0, 1.55), breaks = seq(0, 1, by = 0.25)) +
+  labs(x = "Probability of inclusion", y = "") +
+  nc_theme_forest +
+  theme(aspect.ratio = 1) +
+  scale_y_discrete(labels = c(
+    "LC" = "Least concern", "NT" = "Near-\nthreatened", "VU" = "Vulnerable",
+    "CR" = "Critically\nendangered", "DD" = "Data deficient", "EN" = "Endangered",
+    "UA" = "Unassessed", "EX" = "Extinct"
+  ))
+
+p_iucn_status_model_2
+
+save_figure(p_iucn_status_model_2, "FigS50d_iucn_status_model2", width = 9, height = 6, type = "supplementary")
+
+# Statistics reported in the main text
+
+ref_level_iucn2 <- "LC"   
+strongest_negative_iucn2 <- "UA"  
+
+get_prob_iucn2 <- function(category) {
+  idx <- which(plot_data_iucn_status$iucn_status == category)
+  return(c(estimate = plot_data_iucn_status$estimate__[idx], lower = plot_data_iucn_status$lower__[idx], upper = plot_data_iucn_status$upper__[idx]))
+}
+
+prob_ref_iucn2      <- get_prob_iucn2(ref_level_iucn2)
+prob_negative_iucn2 <- get_prob_iucn2(strongest_negative_iucn2)
+
+change_negative_iucn2 <- (prob_negative_iucn2["estimate"] - prob_ref_iucn2["estimate"]) * 100
+
+cat("\n=== IUCN STATUS (Model 2) ===\n\n")
+cat(sprintf("%s (reference): %.1f%% (95%% CI: %.1f–%.1f%%)\n", ref_level_iucn2, prob_ref_iucn2["estimate"]*100, prob_ref_iucn2["lower"]*100, prob_ref_iucn2["upper"]*100))
+cat(sprintf("%s: %.1f%% (95%% CI: %.1f–%.1f%%), %+0.1f pp vs. %s\n", strongest_negative_iucn2, prob_negative_iucn2["estimate"]*100, prob_negative_iucn2["lower"]*100, prob_negative_iucn2["upper"]*100, change_negative_iucn2, ref_level_iucn2))
+
+
+```
+
+*Diet - model 1:*
+
+```{r}
+
+diet_classes <- c("Frugivore", "Omnivore", "Piscivore", "Insectivore", "Herbivore", 
+                  "Myrmecivore", "Folivore", "Gummivore", "Seminivore", "Granivore", 
+                  "Carnivore", "Hemovore", "Nectarivore")
+
+diet_effects_list_diet1 <- list()
+for (diet in diet_classes) {
+  ce <- conditional_effects(fit_1, effects = diet, prob = 0.95)
+  effect_name <- names(ce)[1]
+  diet_data <- ce[[effect_name]]
+  diet_data_filtered <- diet_data %>%
+    filter(!!sym(diet) == 1) %>%
+    summarise(diet = diet, estimate__ = first(estimate__), lower__ = first(lower__), upper__ = first(upper__))
+  diet_effects_list_diet1[[diet]] <- diet_data_filtered
+}
+plot_data_diet <- do.call(rbind, diet_effects_list_diet1)
+
+model_summary_diet1 <- summary(fit_1)$fixed
+diet_params_diet1 <- model_summary_diet1[grepl("presence_.*1$", rownames(model_summary_diet1)), ]
+
+diet_params_diet1$diet <- gsub("presence_", "", rownames(diet_params_diet1))
+diet_params_diet1$diet <- gsub("1$", "", diet_params_diet1$diet)
+diet_params_diet1$color <- ifelse(diet_params_diet1[["l-95% CI"]] > 0, "#3182bd",
+                                  ifelse(diet_params_diet1[["u-95% CI"]] < 0, "#de2d26", "#969696"))
+
+diet_params_diet1$effect_text <- paste0(round(diet_params_diet1$Estimate, 3), 
+                                        " [", round(diet_params_diet1[["l-95% CI"]], 3), 
+                                        ", ", round(diet_params_diet1[["u-95% CI"]], 3), "]")
+
+plot_data_diet <- merge(plot_data_diet, diet_params_diet1[, c("diet", "color", "effect_text")], by = "diet", all.x = TRUE)
+plot_data_diet <- plot_data_diet %>% arrange(estimate__)
+plot_data_diet$diet <- factor(plot_data_diet$diet, levels = plot_data_diet$diet)
+plot_data_diet$text_x <- plot_data_diet$upper__ + 0.02
+
+p_diet_model_1 <- ggplot(plot_data_diet, aes(y = diet)) +
+  geom_point(aes(x = estimate__, color = color), size = 3) +
+  geom_errorbarh(aes(xmin = lower__, xmax = upper__, color = color), height = 0.2, linewidth = 0.7) +
+  geom_richtext(
+    aes(x = text_x, label = effect_text, color = color),
+    hjust = 0, size = 6, family = "roboto_condensed",
+    fill = NA, label.color = NA, label.padding = unit(0, "pt")
+  ) +
+  geom_richtext(
+    aes(x = 0.8, y = 1, label = "**Reference level** =<br>diet not included"),
+    hjust = 0, vjust = 0, size = 6, family = "roboto_condensed", colour = "black",
+    fill = NA, label.color = NA, label.padding = unit(0, "pt")
+  ) +
+  scale_color_identity() +
+  scale_x_continuous(limits = c(0, 1.1), breaks = seq(0, 1, by = 0.25)) +
+  labs(x = "Probability of inclusion", y = "") +
+  nc_theme_forest +
+  theme(aspect.ratio = 1)
+
+p_diet_model_1
+
+save_figure(p_diet_model_1, "Fig3f_diet", width = 9, height = 8)
+
+# Statistics reported in the main text
+
+ref_level_diet1 <- "Reference (diet not included)"  
+strongest_positive_diet1 <- "Piscivore"   
+strongest_negative_diet1 <- "Seminivore"  
+
+get_prob_diet1 <- function(category) {
+  if (category == ref_level_diet1) {
+    ce_ref_diet1 <- conditional_effects(
+      fit_1, effects = diet_classes, 
+      conditions = as.data.frame(matrix(0, nrow = 1, ncol = length(diet_classes), dimnames = list(NULL, diet_classes))),
+      prob = 0.95
+    )
+    return(c(estimate = ce_ref_diet1[[1]]$estimate__[1], lower = ce_ref_diet1[[1]]$lower__[1], upper = ce_ref_diet1[[1]]$upper__[1]))
+  } else {
+    idx <- which(plot_data_diet$diet == category)
+    return(c(estimate = plot_data_diet$estimate__[idx], lower = plot_data_diet$lower__[idx], upper = plot_data_diet$upper__[idx]))
+  }
+}
+
+prob_ref_diet1      <- get_prob_diet1(ref_level_diet1)
+prob_positive_diet1 <- get_prob_diet1(strongest_positive_diet1)
+prob_negative_diet1 <- get_prob_diet1(strongest_negative_diet1)
+
+change_positive_diet1 <- (prob_positive_diet1["estimate"] - prob_ref_diet1["estimate"]) * 100
+change_negative_diet1 <- (prob_negative_diet1["estimate"] - prob_ref_diet1["estimate"]) * 100
+
+cat("\n=== DIET (Model 1) ===\n\n")
+cat(sprintf("%s: %.1f%% (95%% CI: %.1f–%.1f%%)\n", ref_level_diet1, prob_ref_diet1["estimate"]*100, prob_ref_diet1["lower"]*100, prob_ref_diet1["upper"]*100))
+cat(sprintf("%s: %.1f%% (95%% CI: %.1f–%.1f%%), %+0.1f pp vs. %s\n", strongest_positive_diet1, prob_positive_diet1["estimate"]*100, prob_positive_diet1["lower"]*100, prob_positive_diet1["upper"]*100, change_positive_diet1, ref_level_diet1))
+cat(sprintf("%s: %.1f%% (95%% CI: %.1f–%.1f%%), %+0.1f pp vs. %s\n", strongest_negative_diet1, prob_negative_diet1["estimate"]*100, prob_negative_diet1["lower"]*100, prob_negative_diet1["upper"]*100, change_negative_diet1, ref_level_diet1))
+
+```
+
+*Diet - model 2:*
+
+```{r}
+
+diet_effects_list_diet2 <- list()
+for (diet in diet_classes) {
+  ce <- conditional_effects(fit_2, effects = diet, prob = 0.95)
+  effect_name <- names(ce)[1]
+  diet_data <- ce[[effect_name]]
+  diet_data_filtered <- diet_data %>%
+    filter(!!sym(diet) == 1) %>%
+    summarise(diet = diet, estimate__ = first(estimate__), lower__ = first(lower__), upper__ = first(upper__))
+  diet_effects_list_diet2[[diet]] <- diet_data_filtered
+}
+
+plot_data_diet <- do.call(rbind, diet_effects_list_diet2)
+
+model_summary_diet2 <- summary(fit_2)$fixed
+diet_params_diet2 <- model_summary_diet2[grepl("presence_.*1$", rownames(model_summary_diet2)), ]
+
+diet_params_diet2$diet <- gsub("presence_", "", rownames(diet_params_diet2))
+diet_params_diet2$diet <- gsub("1$", "", diet_params_diet2$diet)
+diet_params_diet2$color <- ifelse(diet_params_diet2[["l-95% CI"]] > 0, "#3182bd",
+                                  ifelse(diet_params_diet2[["u-95% CI"]] < 0, "#de2d26", "#969696"))
+
+diet_params_diet2$effect_text <- paste0(round(diet_params_diet2$Estimate, 3), 
+                                        " [", round(diet_params_diet2[["l-95% CI"]], 3), 
+                                        ", ", round(diet_params_diet2[["u-95% CI"]], 3), "]")
+
+plot_data_diet <- merge(plot_data_diet, diet_params_diet2[, c("diet", "color", "effect_text")], by = "diet", all.x = TRUE)
+plot_data_diet <- plot_data_diet %>% arrange(estimate__)
+plot_data_diet$diet <- factor(plot_data_diet$diet, levels = plot_data_diet$diet)
+plot_data_diet$text_x <- plot_data_diet$upper__ + 0.02
+
+p_diet_model_2 <- ggplot(plot_data_diet, aes(y = diet)) +
+  geom_point(aes(x = estimate__, color = color), size = 3) +
+  geom_errorbarh(aes(xmin = lower__, xmax = upper__, color = color), height = 0.2, linewidth = 0.7) +
+  geom_richtext(
+    aes(x = text_x, label = effect_text, color = color),
+    hjust = 0, size = 6, family = "roboto_condensed",
+    fill = NA, label.color = NA, label.padding = unit(0, "pt")
+  ) +
+  geom_richtext(
+    aes(x = 1.4, y = 1, label = "**Reference level** =<br>diet not included"),
+    hjust = 0, vjust = 0, size = 6, family = "roboto_condensed", colour = "black",
+  fill = NA, label.color = NA, label.padding = unit(0, "pt")
+) +
+  scale_color_identity() +
+  scale_x_continuous(limits = c(0, 1.8), breaks = seq(0, 1, by = 0.25)) +
+  labs(x = "Probability of inclusion", y = "") +
+  nc_theme_forest 
+
+p_diet_model_2
+
+save_figure(p_diet_model_2, "FigS50c_diet_model2", width = 9, height = 8, type = "supplementary")
+
+# Statistics reported in the main text
+
+ref_level_diet2 <- "Reference (diet not included)"  
+strongest_positive_diet2 <- "Omnivore"
+
+get_prob_diet2 <- function(category) {
+  if (category == ref_level_diet2) {
+    ce_ref_diet2 <- conditional_effects(
+      fit_2, effects = diet_classes,
+      conditions = as.data.frame(matrix(0, nrow = 1, ncol = length(diet_classes), dimnames = list(NULL, diet_classes))),
+      prob = 0.95
+    )
+    return(c(estimate = ce_ref_diet2[[1]]$estimate__[1], lower = ce_ref_diet2[[1]]$lower__[1], upper = ce_ref_diet2[[1]]$upper__[1]))
+  } else {
+    idx <- which(plot_data_diet$diet == category)
+    return(c(estimate = plot_data_diet$estimate__[idx], lower = plot_data_diet$lower__[idx], upper = plot_data_diet$upper__[idx]))
+  }
+}
+
+prob_ref_diet2      <- get_prob_diet2(ref_level_diet2)
+prob_positive_diet2 <- get_prob_diet2(strongest_positive_diet2)
+
+change_positive_diet2 <- (prob_positive_diet2["estimate"] - prob_ref_diet2["estimate"]) * 100
+
+cat("\n=== DIET (Model 2) ===\n\n")
+cat(sprintf("%s: %.1f%% (95%% CI: %.1f–%.1f%%)\n", ref_level_diet2, prob_ref_diet2["estimate"]*100, prob_ref_diet2["lower"]*100, prob_ref_diet2["upper"]*100))
+cat(sprintf("%s: %.1f%% (95%% CI: %.1f–%.1f%%), %+0.1f pp vs. %s\n", strongest_positive_diet2, prob_positive_diet2["estimate"]*100, prob_positive_diet2["lower"]*100, prob_positive_diet2["upper"]*100, change_positive_diet2, ref_level_diet2))
+
+
+```
+
+*Endemism - model 1:*
+
+```{r}
+
+
+# BRAZILIAN (NATIONAL) ENDEMISM
+ce_brazilian <- conditional_effects(fit_1, effects = "brazilian_endemic", prob = 0.95)
+plot_data_brazilian <- ce_brazilian[["presence.presence_brazilian_endemic"]]
+
+model_summary <- summary(fit_1)$fixed
+brazilian_params <- model_summary[grepl("presence_brazilian_endemic", rownames(model_summary)), ]
+
+brazilian_params$level <- gsub("presence_brazilian_endemic", "", rownames(brazilian_params))
+brazilian_params$color <- ifelse(brazilian_params[["l-95% CI"]] > 0, "#3182bd",
+                                 ifelse(brazilian_params[["u-95% CI"]] < 0, "#de2d26", "#969696"))
+brazilian_params$effect_text <- paste0(round(brazilian_params$Estimate, 3), 
+                                       " [", round(brazilian_params[["l-95% CI"]], 3), 
+                                       ", ", round(brazilian_params[["u-95% CI"]], 3), "]")
+
+reference_level <- levels(plot_data_brazilian$brazilian_endemic)[1]
+brazilian_colors <- rbind(
+  data.frame(level = reference_level, color = "black", effect_text = "**Reference level**"),
+  brazilian_params[, c("level", "color", "effect_text")]
+)
+
+plot_data_brazilian <- plot_data_brazilian %>% rename(level = brazilian_endemic)
+plot_data_brazilian <- merge(plot_data_brazilian, brazilian_colors, by = "level", all.x = TRUE)
+plot_data_brazilian$group <- "National endemism"
+
+# Keep internal factor value unique ("No_national") to avoid colliding with
+# regional's own "No" level once both are combined into one shared y-axis,
+# but DISPLAY it as plain "No" via scale_y_discrete() below
+plot_data_brazilian <- plot_data_brazilian %>%
+  mutate(level = recode(level, "No" = "No_national"))
+
+# REGIONAL ENDEMISM
+ce_regional <- conditional_effects(fit_1, effects = "regional_endemic", prob = 0.95)
+plot_data_regional <- ce_regional[["presence.presence_regional_endemic"]]
+
+regional_params <- model_summary[grepl("presence_regional_endemic", rownames(model_summary)), ]
+regional_params$level <- gsub("presence_regional_endemic", "", rownames(regional_params))
+regional_params$color <- ifelse(regional_params[["l-95% CI"]] > 0, "#3182bd",
+                                ifelse(regional_params[["u-95% CI"]] < 0, "#de2d26", "#969696"))
+regional_params$effect_text <- paste0(round(regional_params$Estimate, 3), 
+                                      " [", round(regional_params[["l-95% CI"]], 3), 
+                                      ", ", round(regional_params[["u-95% CI"]], 3), "]")
+
+reference_level_regional <- levels(plot_data_regional$regional_endemic)[1]
+regional_colors <- rbind(
+  data.frame(level = reference_level_regional, color = "black", effect_text = "**Reference level**"),
+  regional_params[, c("level", "color", "effect_text")]
+)
+
+plot_data_regional <- plot_data_regional %>% rename(level = regional_endemic)
+plot_data_regional <- merge(plot_data_regional, regional_colors, by = "level", all.x = TRUE)
+plot_data_regional$group <- "Regional endemism"
+# No recode needed - regional keeps its plain "No"
+
+# COMBINE INTO ONE DATAFRAME
+common_cols <- c("level", "group", "estimate__", "lower__", "upper__", "color", "effect_text")
+plot_data_endemism <- rbind(plot_data_brazilian[, common_cols], plot_data_regional[, common_cols])
+
+plot_data_endemism <- plot_data_endemism %>%
+  group_by(group) %>%
+  arrange(group, estimate__) %>%
+  ungroup()
+
+plot_data_endemism$level <- factor(plot_data_endemism$level, levels = unique(plot_data_endemism$level))
+plot_data_endemism$group <- factor(plot_data_endemism$group, levels = c("National endemism", "Regional endemism"))
+plot_data_endemism$text_x <- plot_data_endemism$upper__ + 0.02
+
+# SINGLE COMBINED PANEL, PROPORTIONAL ROW HEIGHTS
+p_endemism_model_1 <- ggplot(plot_data_endemism, aes(y = level)) +
+  geom_point(aes(x = estimate__, color = color), size = 3) +
+  geom_errorbarh(aes(xmin = lower__, xmax = upper__, color = color), height = 0.2, linewidth = 0.7) +
+  geom_richtext(
+    aes(x = text_x, label = effect_text, color = color),
+    hjust = 0, size = 6, family = "roboto_condensed",
+    fill = NA, label.color = NA, label.padding = unit(0, "pt")
+  ) +
+  scale_color_identity() +
+  scale_x_continuous(limits = c(0, 1.00), breaks = seq(0, 1, by = 0.25)) +
+  labs(x = "Probability of inclusion", y = "") +
+  facet_grid(rows = vars(group), scales = "free_y", space = "free_y") +
+  nc_theme_forest +
+  theme(
+    strip.background = element_blank(),
+    strip.text.y = element_text(size = 16, face = "bold", family = "roboto_condensed",
+                                colour = "black", angle = -90, hjust = 0.5),
+    panel.spacing = unit(10, "pt"),
+    panel.border = element_blank(),
+    strip.placement = "outside"
+  ) +
+  scale_y_discrete(labels = c(
+    "No_national" = "No",   # displays as "No"; kept unique internally as "No_national"
+    "Unknown" = "Unknown",
+    "Yes" = "Yes",
+    "Pampa" = "Pampa",
+    "Amazonia" = "Amazon",
+    "Cerrado" = "Cerrado",
+    "Caatinga" = "Caatinga",
+    "Atlantic_forest" = "Atlantic\nForest",
+    "Cerrado_Caatinga" = "Cerrado-\nCaatinga",
+    "Pantanal" = "Pantanal"
+  ))
+
+p_endemism_model_1
+
+save_figure(p_endemism_model_1, "Fig3g_endemism", width = 9, height = 8)
+
+# Statistics reported in the main text:
+
+ref_level <- "No"
+strongest_positive <- "Cerrado_Caatinga"
+strongest_negative <- "Pantanal"
+
+get_prob <- function(category) {
+  idx <- which(plot_data_regional$level == category)
+  return(c(estimate = plot_data_regional$estimate__[idx], lower = plot_data_regional$lower__[idx], upper = plot_data_regional$upper__[idx]))
+}
+
+prob_ref      <- get_prob(ref_level)
+prob_positive <- get_prob(strongest_positive)
+prob_negative <- get_prob(strongest_negative)
+
+change_positive <- (prob_positive["estimate"] - prob_ref["estimate"]) * 100
+change_negative <- (prob_negative["estimate"] - prob_ref["estimate"]) * 100
+
+cat("\n=== REGIONAL ENDEMISM (Model 1) ===\n\n")
+cat(sprintf("%s (reference): %.1f%% (95%% CI: %.1f–%.1f%%)\n", ref_level, prob_ref["estimate"]*100, prob_ref["lower"]*100, prob_ref["upper"]*100))
+cat(sprintf("%s: %.1f%% (95%% CI: %.1f–%.1f%%), %+0.1f pp vs. %s\n", strongest_positive, prob_positive["estimate"]*100, prob_positive["lower"]*100, prob_positive["upper"]*100, change_positive, ref_level))
+cat(sprintf("%s: %.1f%% (95%% CI: %.1f–%.1f%%), %+0.1f pp vs. %s\n", strongest_negative, prob_negative["estimate"]*100, prob_negative["lower"]*100, prob_negative["upper"]*100, change_negative, ref_level))
+
+```
+
+*Endemism - model 2:*
+
+```{r}
+
+
+# BRAZILIAN (NATIONAL) ENDEMISM
+ce_brazilian <- conditional_effects(fit_2, effects = "brazilian_endemic", prob = 0.95)
+plot_data_brazilian <- ce_brazilian[["presence.presence_brazilian_endemic"]]
+
+model_summary <- summary(fit_2)$fixed
+brazilian_params <- model_summary[grepl("presence_brazilian_endemic", rownames(model_summary)), ]
+
+brazilian_params$level <- gsub("presence_brazilian_endemic", "", rownames(brazilian_params))
+brazilian_params$color <- ifelse(brazilian_params[["l-95% CI"]] > 0, "#3182bd",
+                                 ifelse(brazilian_params[["u-95% CI"]] < 0, "#de2d26", "#969696"))
+brazilian_params$effect_text <- paste0(round(brazilian_params$Estimate, 3), 
+                                       " [", round(brazilian_params[["l-95% CI"]], 3), 
+                                       ", ", round(brazilian_params[["u-95% CI"]], 3), "]")
+
+reference_level <- levels(plot_data_brazilian$brazilian_endemic)[1]
+brazilian_colors <- rbind(
+  data.frame(level = reference_level, color = "black", effect_text = "**Reference level**"),
+  brazilian_params[, c("level", "color", "effect_text")]
+)
+
+plot_data_brazilian <- plot_data_brazilian %>% rename(level = brazilian_endemic)
+plot_data_brazilian <- merge(plot_data_brazilian, brazilian_colors, by = "level", all.x = TRUE)
+plot_data_brazilian$group <- "National endemism"
+
+plot_data_brazilian <- plot_data_brazilian %>%
+  mutate(level = recode(level, "No" = "No_national"))
+
+# REGIONAL ENDEMISM
+ce_regional <- conditional_effects(fit_2, effects = "regional_endemic", prob = 0.95)
+plot_data_regional <- ce_regional[["presence.presence_regional_endemic"]]
+
+regional_params <- model_summary[grepl("presence_regional_endemic", rownames(model_summary)), ]
+regional_params$level <- gsub("presence_regional_endemic", "", rownames(regional_params))
+regional_params$color <- ifelse(regional_params[["l-95% CI"]] > 0, "#3182bd",
+                                ifelse(regional_params[["u-95% CI"]] < 0, "#de2d26", "#969696"))
+regional_params$effect_text <- paste0(round(regional_params$Estimate, 3), 
+                                      " [", round(regional_params[["l-95% CI"]], 3), 
+                                      ", ", round(regional_params[["u-95% CI"]], 3), "]")
+
+reference_level_regional <- levels(plot_data_regional$regional_endemic)[1]
+regional_colors <- rbind(
+  data.frame(level = reference_level_regional, color = "black", effect_text = "**Reference level**"),
+  regional_params[, c("level", "color", "effect_text")]
+)
+
+plot_data_regional <- plot_data_regional %>% rename(level = regional_endemic)
+plot_data_regional <- merge(plot_data_regional, regional_colors, by = "level", all.x = TRUE)
+plot_data_regional$group <- "Regional endemism"
+
+# COMBINE INTO ONE DATAFRAME
+common_cols <- c("level", "group", "estimate__", "lower__", "upper__", "color", "effect_text")
+plot_data_endemism <- rbind(plot_data_brazilian[, common_cols], plot_data_regional[, common_cols])
+
+plot_data_endemism <- plot_data_endemism %>%
+  group_by(group) %>%
+  arrange(group, estimate__) %>%
+  ungroup()
+
+plot_data_endemism$level <- factor(plot_data_endemism$level, levels = unique(plot_data_endemism$level))
+plot_data_endemism$group <- factor(plot_data_endemism$group, levels = c("National endemism", "Regional endemism"))
+plot_data_endemism$text_x <- plot_data_endemism$upper__ + 0.02
+
+# SINGLE COMBINED PANEL, PROPORTIONAL ROW HEIGHTS
+p_endemism_model_2 <- ggplot(plot_data_endemism, aes(y = level)) +
+  geom_point(aes(x = estimate__, color = color), size = 3) +
+  geom_errorbarh(aes(xmin = lower__, xmax = upper__, color = color), height = 0.2, linewidth = 0.7) +
+  geom_richtext(
+    aes(x = text_x, label = effect_text, color = color),
+    hjust = 0, size = 6, family = "roboto_condensed",
+    fill = NA, label.color = NA, label.padding = unit(0, "pt")
+  ) +
+  scale_color_identity() +
+  scale_x_continuous(limits = c(0, 1.35), breaks = seq(0, 1, by = 0.25)) +
+  labs(x = "Probability of inclusion", y = "") +
+  facet_grid(rows = vars(group), scales = "free_y", space = "free_y") +
+  nc_theme_forest +
+  theme(
+    strip.background = element_blank(),
+    strip.text.y = element_text(size = 16, face = "bold", family = "roboto_condensed",
+                                colour = "black", angle = -90, hjust = 0.5),
+    panel.spacing = unit(10, "pt"),
+    panel.border = element_blank(),
+    strip.placement = "outside"
+  ) +
+  scale_y_discrete(labels = c(
+    "No_national" = "No",
+    "Unknown" = "Unknown",
+    "Yes" = "Yes",
+    "Pampa" = "Pampa",
+    "Amazonia" = "Amazon",
+    "Cerrado" = "Cerrado",
+    "Caatinga" = "Caatinga",
+    "Atlantic_forest" = "Atlantic\nForest",
+    "Cerrado_Caatinga" = "Cerrado-\nCaatinga",
+    "Pantanal" = "Pantanal"
+  ))
+
+p_endemism_model_2
+
+
+# Statistics reported in the main text:
+
+ref_level <- "No"
+strongest_positive <- "Cerrado_Caatinga"
+strongest_negative <- "Pantanal"
+
+get_prob <- function(category) {
+  idx <- which(plot_data_regional$level == category)
+  return(c(estimate = plot_data_regional$estimate__[idx], lower = plot_data_regional$lower__[idx], upper = plot_data_regional$upper__[idx]))
+}
+
+prob_ref      <- get_prob(ref_level)
+prob_positive <- get_prob(strongest_positive)
+prob_negative <- get_prob(strongest_negative)
+
+change_positive <- (prob_positive["estimate"] - prob_ref["estimate"]) * 100
+change_negative <- (prob_negative["estimate"] - prob_ref["estimate"]) * 100
+
+cat("\n=== REGIONAL ENDEMISM (Model 2) ===\n\n")
+cat(sprintf("%s (reference): %.1f%% (95%% CI: %.1f–%.1f%%)\n", ref_level, prob_ref["estimate"]*100, prob_ref["lower"]*100, prob_ref["upper"]*100))
+cat(sprintf("%s: %.1f%% (95%% CI: %.1f–%.1f%%), %+0.1f pp vs. %s\n", strongest_positive, prob_positive["estimate"]*100, prob_positive["lower"]*100, prob_positive["upper"]*100, change_positive, ref_level))
+cat(sprintf("%s: %.1f%% (95%% CI: %.1f–%.1f%%), %+0.1f pp vs. %s\n", strongest_negative, prob_negative["estimate"]*100, prob_negative["lower"]*100, prob_negative["upper"]*100, change_negative, ref_level))
+
+
+```
+
+Combine the plots for model 1:
+
+```{r}
+
+p_time_since_description_model_1 <- p_time_since_description_model_1 + theme(aspect.ratio = NULL)
+p_rangesize_model_1               <- p_rangesize_model_1 + theme(aspect.ratio = NULL)
+p_bodymass_model_1                <- p_bodymass_model_1 + theme(aspect.ratio = NULL)
+p_locomotion_model_1              <- p_locomotion_model_1 + theme(aspect.ratio = NULL)
+p_iucn_status_model_1             <- p_iucn_status_model_1 + theme(aspect.ratio = NULL)
+p_diet_model_1                    <- p_diet_model_1 + theme(aspect.ratio = NULL)
+
+
+
+
+# Tag A/B/C using ggplot's native tag mechanism, not cowplot's labels
+p_time_since_description_model_1 <- p_time_since_description_model_1 +
+  labs(tag = "a.") +
+  theme(plot.tag = element_text(size = 20, face = "bold", family = "roboto_condensed"))
+
+p_rangesize_model_1 <- p_rangesize_model_1 +
+  labs(tag = "b.") +
+  theme(plot.tag = element_text(size = 20, face = "bold", family = "roboto_condensed"))
+
+p_bodymass_model_1 <- p_bodymass_model_1 +
+  labs(tag = "c.") +
+  theme(plot.tag = element_text(size = 20, face = "bold", family = "roboto_condensed"))
+
+# Align row 1 with cowplot, no labels argument
+row1_aligned <- plot_grid(
+  p_time_since_description_model_1,
+  p_rangesize_model_1,
+  p_bodymass_model_1,
+  align = "hv",
+  axis = "tblr",
+  nrow = 1
+)
+
+row1_aligned   # check this row alone before combining
+
+# Insert into the full composite
+design <- "
+AAAAAA
+AAAAAA
+DDDEEE
+DDDEEE
+DDDEEE
+FFFGGG
+FFFGGG
+FFFGGG
+FFFGGG
+FFFGGG
+"
+
+p_figure3_model1 <- 
+  wrap_elements(full = row1_aligned) +
+  p_locomotion_model_1 +
+  p_iucn_status_model_1 +
+  p_diet_model_1 +
+  p_endemism_model_1 +
+  plot_layout(design = design) +
+  plot_annotation(tag_levels = list(c("", "d.", "e.", "f.", "g."))) &
+  theme(
+    plot.tag = element_text(size = 20, face = "bold", family = "roboto_condensed")
+  )
+
+p_figure3_model1
+
+save_figure(p_figure3_model1, "Fig3_composite", width = 12, height = 16)
+
+```
+
+[Phylogenetic effect - model 2]{.underline}:
+
+```{r}
+
+
+# 1. Extract per-species phylogenetic random effects (Model 2)
+
+draws <- as_draws(fit_2)
+
+phylo_effects_long <- purrr::map_dfr(draws, function(chain) {
+  as_draws_df(chain) %>%
+    select(matches("^r_binomial__presence\\[")) %>%
+    tidyr::pivot_longer(cols = everything(), names_to = "species", values_to = "effect")
+}, .id = "chain")
+
+phylo_effects_long$species <- gsub("^r_binomial__presence\\[(.+?),Intercept\\]$", "\\1", phylo_effects_long$species)
+phylo_effects_long$species <- gsub("\\.", " ", phylo_effects_long$species)
+
+phylo_effects_summary <- phylo_effects_long %>%
+  group_by(species) %>%
+  summarise(median_effect = median(effect)) %>%
+  rename(id = species)
+
+# 2. Prepare the tree and per-order annotation data
+#    (brz_mam_tree[[1]] is already Brazilian-only and retains
+#    graft_status, so no phylacine_tree_grafted needed)
+
+tree_for_plot <- brz_mam_tree[[1]]
+tree_for_plot <- ape::drop.tip(tree_for_plot, setdiff(tree_for_plot$tip.label, unique(phylo_effects_long$species)))
+
+graft_status <- brz_mam_tree[[1]]$graft_status
+graft_status$species <- gsub("_", " ", graft_status$species)
+graft_status <- graft_status[graft_status$species %in% brz_mam_taxonomy$binomial, ]
+
+graft_status <- graft_status %>%
+  mutate(graft = case_when(
+    status == "grafted at genus level"          ~ "genus",
+    status == "grafted at family level"          ~ "family",
+    status == "exisiting species in the megatree" ~ "none"
+  )) %>%
+  rename(id = species) %>%
+  select(-tip_label)
+
+orders_nodes <- brz_mam_taxonomy %>%
+  select(binomial, order) %>%
+  group_by(order) %>%
+  summarise(
+    mrca_node = if (n() > 1) {
+      ape::getMRCA(tree_for_plot, binomial)
+    } else {
+      which(tree_for_plot$tip.label == binomial)
+    },
+    .groups = "drop"
+  )
+
+phylopics <- data.frame(
+  order = c("Artiodactyla", "Carnivora", "Chiroptera", "Cingulata", "Didelphimorphia",
+            "Lagomorpha", "Perissodactyla", "Pilosa", "Primates", "Rodentia", "Sirenia"),
+  image = c("f36c9daa-a102-42dd-88ac-a126753943d2", "9b6dc5fd-eeb9-4760-99e4-fca70ec74db0",
+            "21180755-3394-40bf-93eb-810954c0f7ba", "5d59b5ce-c1dd-40f6-b295-8d2629b9775e",
+            "0e1fe113-feb7-46db-8a10-12f22f80332c", "031b0020-2389-473b-8b71-d855ec2c06d5",
+            "4fcdd729-6eb6-42b8-be67-303077fa6d19", "925fa570-10d9-4319-bd8a-e64ad7987900",
+            "cbfc863c-9ca3-441e-9e38-95876fe19203", "9c234021-ce53-45d9-8fdd-b0ca3115a451",
+            "12597d6c-9c80-4510-9826-975eabddc597")
+)
+
+orders_nodes <- merge(orders_nodes, phylopics, by = "order")
+orders_nodes$offset_phy <- c(38, 38, 32, 40, 32, 32, 32, 32, 32, 32, 32)
+orders_nodes$size_phy   <- c(2, 1, 1, 1, 1.5, 1, 1, 1, 0.5, 1, 1)
+orders_nodes$colour_phy <- "black"
+orders_nodes$alpha_phy  <- 1
+
+order_effects <- phylo_effects_summary %>%
+  left_join(brz_mam_taxonomy %>% select(binomial, order), by = c("id" = "binomial")) %>%
+  group_by(order) %>%
+  summarise(mean_effect = mean(median_effect, na.rm = TRUE))
+
+orders_nodes <- orders_nodes %>%
+  left_join(order_effects, by = "order")
+
+# 3. Legend styling
+
+phylo_legend_theme <- theme(
+  legend.title = element_text(size = 11, face = "bold", family = "roboto_condensed", hjust = 0.5),
+  legend.text  = element_text(size = 9, family = "roboto_condensed"),
+  legend.direction = "horizontal",
+  legend.key.width  = unit(1, "cm"),
+  legend.key.height = unit(0.4, "cm"),
+  legend.key = element_rect(color = "black", linewidth = 0.3),
+  legend.box.margin = margin(t = -60)   # pulls the legend block up, closer to the tree
+)
+
+# 4. Build the tree
+
+# Layer 1: graft status (family/genus/none) as an inner ring
+tree_plot_1 <- ggtree(tree_for_plot, layout = "fan", open.angle = 180) %<+%
+  graft_status +
+  geom_fruit(geom = geom_tile, mapping = aes(fill = factor(graft)), width = 8, offset = 0.03) +
+  scale_fill_manual(values = c("family" = "grey25", "genus" = "grey75", "none" = "white")) +
+  theme_tree() +
+  phylo_legend_theme +
+  theme(legend.position = "bottom") +
+  guides(fill = guide_legend(
+    title = "Graft status",
+    title.position = "top",
+    label.position = "bottom"
+  ))
+
+# Layer 2: predicted phylogenetic effect as an outer ring
+tree_plot_2 <- tree_plot_1 %<+% phylo_effects_summary +
+  new_scale_fill() +
+  geom_fruit(geom = geom_tile, mapping = aes(fill = plogis(median_effect)), width = 8, offset = 0.05) +
+  scale_fill_scico(palette = "vik", midpoint = 0.5, limits = c(0, 1), direction = -1) +
+  phylo_legend_theme +
+  theme(legend.position = "bottom") +
+  guides(fill = guide_colorbar(
+    title = "Predicted inclusion probability deviation",
+    title.position = "top"
+  ))
+
+# Layer 3: order-level bracket bars
+tree_plot_3 <- tree_plot_2 +
+  geom_cladelab(
+    node = orders_nodes$mrca_node,
+    label = "",
+    color = "black",
+    offset = 20,
+    align = TRUE,
+    barsize = 1.5
+  )
+
+# Layer 4: order-level mean effect labels
+tree_plot_4 <- tree_plot_3 +
+  geom_cladelab(
+    node = orders_nodes$mrca_node,
+    label = round(plogis(orders_nodes$mean_effect), 2),
+    color = "black",
+    offset = orders_nodes$offset_phy,
+    align = TRUE,
+    barsize = 0,
+    textsize = 4,
+    fontface = "bold",
+    family = "roboto_condensed"
+  )
+
+tree_plot_4
+
+# 5. Save
+
+save_figure(tree_plot_4, "FigS50e_phylogenetic_effect_model2", width = 11, height = 11, type = "supplementary")
+
+
+```
+
+# 2. Save outputs for the next steps
+
+The fitted models are saved in `output/models/` (`fit_0.rds`, `fit_1.rds`, `fit_2.rds`). Part 4 also needs the modelling data and the phylogenetic correlation matrix, ordered as used in Model 2.
+
+```{r}
+
+save_step("3_Drivers_of_database_omission", c(
+  "brz_mam_completeness_traits_all",
+  "phylacine_average_vcv_matrix_brz"
+))
+
+```
+
+This completes the models of database inclusion. The next step is `4_Barcoding_priorities.Rmd`.
+
+```{r}
+
+sessionInfo()
+
+```

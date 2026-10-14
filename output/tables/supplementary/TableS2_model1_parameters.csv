@@ -1,0 +1,43 @@
+"group","Parameter","Estimate","SD","Lower 95% CI","Upper 95% CI","Overlapping 0?","Direction","R-hat","Bulk ESS","Tail ESS"
+"Intercept","Intercept",-0.755,0.211,-1.164,-0.344,"No","Negative",1,2278.17726797658,3755.35822943051
+"Random effects","Primer (sd)",0.391,0.104,0.239,0.643,"No","Positive",1.001,2367.2798156966,4153.48032452634
+"Continuous variables","Body mass (g)",0.707,0.057,0.599,0.821,"No","Positive",1.001,6237.53370782185,5997.34820515168
+"Continuous variables","Range size (km2)",0.535,0.058,0.421,0.646,"No","Positive",1.001,5825.39511091127,6003.78700761705
+"Continuous variables","Time since description (years)",0.348,0.044,0.263,0.433,"No","Positive",1,8563.29592215424,6293.06559580962
+"Continuous variables","Human population density in range (95th perc.)",0.025,0.046,-0.065,0.113,"Yes","None",1,7449.96598708757,6412.00025325834
+"Regional endemism | Reference category = No","Cerrado/Caatinga",0.507,0.236,0.054,0.966,"No","Positive",1,11953.1104059613,6252.63614281294
+"Regional endemism | Reference category = No","Caatinga",0.078,0.257,-0.432,0.564,"Yes","None",1,12822.1746721864,6265.16918250114
+"Regional endemism | Reference category = No","Amazonia",0.05,0.085,-0.114,0.215,"Yes","None",1,7638.32139012895,6895.70436527288
+"Regional endemism | Reference category = No","Pampa",-0.224,0.264,-0.738,0.289,"Yes","None",1.001,11789.5401369995,5676.63162146691
+"Regional endemism | Reference category = No","Cerrado",-0.351,0.183,-0.71,0.005,"Yes","None",1,11205.007932117,6256.88992868864
+"Regional endemism | Reference category = No","Atlantic forest",-0.506,0.122,-0.748,-0.269,"No","Negative",1,10856.8432137148,6534.80397806591
+"Regional endemism | Reference category = No","Pantanal",-0.891,0.276,-1.44,-0.357,"No","Negative",1,12396.1214608584,5758.07876277468
+"National endemism | Reference category = No","Unknown",0.517,0.274,-0.018,1.046,"Yes","None",1.001,12335.3123917796,6374.22003220749
+"National endemism | Reference category = No","Yes",-0.152,0.089,-0.324,0.019,"Yes","None",1.001,9849.68234662547,6773.64463716388
+"IUCN Status | Reference category = Least concern","Endangered",0.151,0.149,-0.138,0.436,"Yes","None",1,9950.80673326154,6205.4188377872
+"IUCN Status | Reference category = Least concern","Near-threatened",0.071,0.15,-0.219,0.36,"Yes","None",1,11086.7856195564,6385.26267858261
+"IUCN Status | Reference category = Least concern","Critically endangered",-0.071,0.199,-0.458,0.317,"Yes","None",1.001,11716.5004220605,6300.58359961151
+"IUCN Status | Reference category = Least concern","Vulnerable",-0.124,0.13,-0.382,0.131,"Yes","None",1,10226.007959024,5705.04624875886
+"IUCN Status | Reference category = Least concern","Extinct",-0.239,0.464,-1.158,0.665,"Yes","None",1,11710.4410240467,6258.54930651343
+"IUCN Status | Reference category = Least concern","Data deficient",-0.386,0.102,-0.585,-0.188,"No","Negative",1,10194.3319285804,6191.56666728704
+"IUCN Status | Reference category = Least concern","Unassessed",-0.931,0.13,-1.187,-0.676,"No","Negative",1,5618.01985853667,5900.76045662131
+"Habitat use | Reference category = Terrestrial","Volant",1.204,0.17,0.869,1.532,"No","Positive",1,3303.53753976463,4766.57652381117
+"Habitat use | Reference category = Terrestrial","Arboreal",0.923,0.142,0.641,1.199,"No","Positive",1.001,4382.61107165038,5513.29195191837
+"Habitat use | Reference category = Terrestrial","Fossorial",0.895,0.25,0.4,1.386,"No","Positive",1,11989.5969261234,6626.02722919445
+"Habitat use | Reference category = Terrestrial","Scansorial",0.438,0.127,0.194,0.684,"No","Positive",1,8259.50077449036,6870.30939880213
+"Habitat use | Reference category = Terrestrial","Semi-fossorial",0.419,0.158,0.106,0.732,"No","Positive",1,8699.6065979506,6572.24613713415
+"Habitat use | Reference category = Terrestrial","Semi-aquatic",-0.693,0.194,-1.071,-0.311,"No","Negative",1.001,10634.8490647739,5526.73324552129
+"Habitat use | Reference category = Terrestrial","Aquatic",-1.068,0.33,-1.715,-0.421,"No","Negative",1,10519.2486986429,6339.41264736654
+"Diet | Reference category = 0","Piscivore",0.839,0.283,0.294,1.388,"No","Positive",1,8567.03829742534,6305.07536307919
+"Diet | Reference category = 0","Hemovore",0.747,0.357,0.054,1.459,"No","Positive",1,13408.0526867869,5338.48879099962
+"Diet | Reference category = 0","Granivore",0.626,0.17,0.292,0.954,"No","Positive",1,3505.28491201538,5061.46221544975
+"Diet | Reference category = 0","Gummivore",0.427,0.214,0.006,0.85,"No","Positive",1,10659.218863237,6336.1648727078
+"Diet | Reference category = 0","Frugivore",0.33,0.085,0.166,0.501,"No","Positive",1,7217.12169936104,6194.51950293121
+"Diet | Reference category = 0","Omnivore",0.282,0.13,0.023,0.537,"No","Positive",1,4006.22078191695,5811.97338944205
+"Diet | Reference category = 0","Carnivore",0.132,0.21,-0.271,0.539,"Yes","None",1,6380.52496552375,6206.91102571844
+"Diet | Reference category = 0","Herbivore",0.052,0.18,-0.289,0.406,"Yes","None",1,3953.97025018634,5689.04859953061
+"Diet | Reference category = 0","Insectivore",-0.076,0.092,-0.255,0.103,"Yes","None",1,6359.85209409659,6435.07207470326
+"Diet | Reference category = 0","Folivore",-0.092,0.127,-0.334,0.158,"Yes","None",1,6217.35621477135,6319.57329160038
+"Diet | Reference category = 0","Nectarivore",-0.222,0.193,-0.601,0.162,"Yes","None",1.001,11028.6059153439,5892.31232056849
+"Diet | Reference category = 0","Myrmecivore",-0.661,0.238,-1.129,-0.193,"No","Negative",1,7471.67917352934,5555.72009423967
+"Diet | Reference category = 0","Seminivore",-1.08,0.137,-1.352,-0.806,"No","Negative",1,6388.03857126831,6413.6652569254

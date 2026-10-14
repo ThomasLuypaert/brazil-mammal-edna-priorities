@@ -1,0 +1,3 @@
+"pair_type","n_pairs","median_completeness_all","q1_completeness_all","q3_completeness_all","median_gain_all","median_completeness_unambiguous","q1_completeness_unambiguous","q3_completeness_unambiguous","median_gain_unambiguous"
+"cross-locus",35,52.3,47.7,66.9,6.6,49.1,45.2,63.8,7.5
+"within-locus",10,43.8,43.8,48.1,0.1,41.4,41.1,43.4,1.7

@@ -1,0 +1,243 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Brazilian mammal sequencing priorities</title>
+  <meta name="description" content="Which Brazilian mammals still lack reference sequences for eDNA metabarcoding, why they are priorities, and where they occur. Interactive companion to Luypaert et al. (2026), Nature Communications.">
+  <link rel="stylesheet" href="assets/vendor/leaflet/leaflet.css">
+  <link rel="stylesheet" href="assets/vendor/tabulator/tabulator.min.css">
+  <link rel="stylesheet" href="assets/css/site.css">
+</head>
+<body>
+
+<a class="skip" href="#map-section">Skip to the map</a>
+
+<header class="site-header">
+  <div class="wrap header-inner">
+    <div class="title-block">
+      <h1>Sequencing priorities for Brazilian mammals</h1>
+      <p class="lede">Which of Brazil’s 731 continental mammal species still need reference sequences for eDNA metabarcoding, why they matter, and where they occur.</p>
+    </div>
+    <nav class="site-nav" aria-label="Sections">
+      <a href="#map-section">Map</a>
+      <a href="#list-section">Priority list</a>
+      <a href="#sequences-section">Reference sequences</a>
+      <a href="#about-section">About</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+
+  <!-- Map explorer -->
+  <section id="map-section" class="map-section" aria-labelledby="map-heading">
+    <div class="wrap">
+      <div class="section-head">
+        <h2 id="map-heading">Where the priority species occur</h2>
+        <p>Each square is a 25 × 25 km grid cell, shaded by the number of priority species whose range covers it. Select a cell to list them.</p>
+      </div>
+
+      <div class="map-controls" role="group" aria-label="Map layer">
+        <fieldset class="segmented" id="ctl-group">
+          <legend>Priority category</legend>
+          <label><input type="radio" name="group" value="all" checked><span>All priorities</span></label>
+          <label><input type="radio" name="group" value="conservation"><span>Conservation</span></label>
+          <label><input type="radio" name="group" value="research"><span>Research</span></label>
+          <label><input type="radio" name="group" value="watch"><span>Watch</span></label>
+        </fieldset>
+        <fieldset class="segmented" id="ctl-persp">
+          <legend>Perspective</legend>
+          <label><input type="radio" name="persp" value="either" checked><span>Either</span></label>
+          <label><input type="radio" name="persp" value="global"><span>Global</span></label>
+          <label><input type="radio" name="persp" value="local"><span>Local (Brazil)</span></label>
+        </fieldset>
+      </div>
+
+      <div class="explorer">
+        <div class="map-wrap">
+          <div id="map" role="application" aria-label="Map of Brazil showing priority species richness. Select a grid cell to list its species."></div>
+          <label class="layer-toggle check" hidden id="ref-toggle"><input type="checkbox" checked><span>Cities and rivers</span></label>
+          <div class="legend" aria-hidden="true">
+            <span class="legend-title" id="legend-title">Priority species per cell</span>
+            <div class="legend-ramp"></div>
+            <div class="legend-scale"><span>0</span><span id="legend-max">–</span></div>
+          </div>
+        </div>
+
+        <aside class="panel" id="panel" aria-live="polite">
+          <div id="panel-empty" class="panel-empty">
+            <h3>Select a grid cell</h3>
+            <p>The species whose range overlaps the cell are listed here, with their category from the global and the local (Brazilian) perspective.</p>
+            <table class="summary-table" id="summary-table">
+              <caption>Priority species in Brazil</caption>
+              <thead><tr><th scope="col">Category</th><th scope="col">Global</th><th scope="col">Local</th></tr></thead>
+              <tbody></tbody>
+            </table>
+            <p class="note" id="range-note"></p>
+          </div>
+          <div id="panel-cell" class="panel-cell" hidden>
+            <div class="panel-cell-head">
+              <h3 id="cell-title">Grid cell</h3>
+              <button type="button" class="link-button" id="cell-clear">Clear selection</button>
+            </div>
+            <p class="cell-meta" id="cell-meta"></p>
+            <p class="cell-actions"><button type="button" class="button" id="cell-sequences">Reference sequences for this cell</button></p>
+            <ol class="species-list" id="cell-species"></ol>
+          </div>
+        </aside>
+      </div>
+    </div>
+  </section>
+
+  <!-- Priority list -->
+  <section id="list-section" class="list-section" aria-labelledby="list-heading">
+    <div class="wrap">
+      <div class="section-head">
+        <h2 id="list-heading">Priority list</h2>
+        <p>All 731 species with their Barcoding Priority Score (BPS) and its components. Sort by any column, filter with the fields under the column names, and download the rows you see.</p>
+      </div>
+      <div class="table-toolbar">
+        <label class="search">
+          <span>Search species or common name</span>
+          <input type="search" id="table-search" placeholder="e.g. Cyclopes or titi">
+        </label>
+        <label class="toggle">
+          <input type="checkbox" id="priority-only" checked>
+          <span>Priority species only</span>
+        </label>
+        <span class="row-count" id="row-count" aria-live="polite"></span>
+        <button type="button" class="button" id="table-download">Download table (CSV)</button>
+      </div>
+      <div id="priority-table"></div>
+      <details class="definitions">
+        <summary>Column definitions</summary>
+        <dl>
+          <dt>Global and local category</dt><dd>Priority category from the global perspective (IUCN Red List, global mammal phylogeny) and the local perspective (SALVE national red list, Brazilian mammal phylogeny). Highest and near priority species are threatened; research priority species are Data Deficient or unassessed; watch priority species are Least Concern or Near Threatened.</dd>
+          <dt>BPS</dt><dd>Barcoding Priority Score: evolutionary distinctiveness (ED₂) × extinction probability × probability of omission from reference databases (PO). Median across posterior draws and trees.</dd>
+          <dt>ED₂</dt><dd>Evolutionary distinctiveness, in million years, on the global or Brazilian phylogeny.</dd>
+          <dt>GE₂ and LE₂</dt><dd>Probability of extinction over 50 years, from the IUCN Red List (GE₂) or SALVE (LE₂).</dd>
+          <dt>PO</dt><dd>Modelled probability that the species lacks a reference sequence, across the 10 primers.</dd>
+          <dt>Primers with sequences</dt><dd>Number of the 10 primers for which the species has at least one reference sequence.</dd>
+        </dl>
+      </details>
+    </div>
+  </section>
+
+  <!-- Sequences -->
+  <section id="sequences-section" class="sequences-section" aria-labelledby="seq-heading">
+    <div class="wrap">
+      <div class="section-head">
+        <h2 id="seq-heading">Reference sequences</h2>
+        <p>Download the reference sequences of Brazilian mammals used in the paper, for one or more primers, filtered by order, priority category or location. Sequences were extracted from MIDORI2 (GenBank release 264) with CRABS.</p>
+      </div>
+
+      <form class="seq-form" id="seq-form">
+        <fieldset class="seq-primers">
+          <legend>Primers</legend>
+          <div class="primer-groups" id="primer-groups"></div>
+          <p class="field-actions"><button type="button" class="link-button" data-select="primers-all">Select all</button> <button type="button" class="link-button" data-select="primers-none">Clear</button></p>
+        </fieldset>
+
+        <fieldset class="seq-filters">
+          <legend>Species</legend>
+          <label class="field">
+            <span>Order</span>
+            <select id="seq-order">
+              <option value="">All orders</option>
+            </select>
+          </label>
+          <label class="field">
+            <span>Priority</span>
+            <select id="seq-priority">
+              <option value="">All species</option>
+              <option value="any">Priority from either perspective</option>
+              <optgroup label="Global perspective">
+                <option value="g:conservation">Conservation priority (global)</option>
+                <option value="g:research">Research priority (global)</option>
+                <option value="g:watch">Watch priority (global)</option>
+              </optgroup>
+              <optgroup label="Local perspective">
+                <option value="l:conservation">Conservation priority (local)</option>
+                <option value="l:research">Research priority (local)</option>
+                <option value="l:watch">Watch priority (local)</option>
+              </optgroup>
+            </select>
+          </label>
+          <label class="check">
+            <input type="checkbox" id="seq-unambiguous">
+            <span>Unambiguous sequences only (not shared with another Brazilian species)</span>
+          </label>
+          <fieldset class="format">
+            <legend>Format</legend>
+            <label class="check"><input type="radio" name="format" value="fasta" checked><span>FASTA</span></label>
+            <label class="check"><input type="radio" name="format" value="csv"><span>CSV</span></label>
+          </fieldset>
+        </fieldset>
+
+        <fieldset class="seq-location" id="seq-location">
+          <legend>Location <small>(optional)</small></legend>
+          <p class="hint">Enter coordinates in Brazil to keep only the species whose range map overlaps that 25 × 25 km grid cell, or select a cell on the map and use <em>Reference sequences for this cell</em>.</p>
+          <div class="coords">
+            <label class="field">
+              <span>Latitude</span>
+              <input type="text" id="seq-lat" inputmode="decimal" autocomplete="off" spellcheck="false" placeholder="e.g. −3.10">
+            </label>
+            <label class="field">
+              <span>Longitude</span>
+              <input type="text" id="seq-lon" inputmode="decimal" autocomplete="off" spellcheck="false" placeholder="e.g. −60.02">
+            </label>
+            <button type="button" class="link-button" id="seq-loc-clear">Clear</button>
+          </div>
+          <p class="loc-status" id="loc-status" aria-live="polite">Decimal degrees; south and west are negative. You can also paste both values into the latitude field.</p>
+          <label class="check">
+            <input type="checkbox" id="seq-nomap" checked>
+            <span>Also include the species without a range map (<span id="nomap-n">48</span> species), which could occur anywhere</span>
+          </label>
+          <p class="note caveat">Range maps are approximate and incomplete. Recently described or split species, and species whose known range is out of date, may occur here even though their range map does not overlap the cell; species whose map overlaps the cell may be absent from parts of it. Use the list as a starting point, not as a checklist.</p>
+        </fieldset>
+
+        <div class="seq-summary">
+          <p class="seq-count" id="seq-count" aria-live="polite">Select at least one primer.</p>
+          <p class="seq-gap" id="seq-gap" hidden></p>
+          <div class="seq-buttons">
+            <button type="submit" class="button button-primary" id="seq-download" disabled>Download sequences</button>
+            <button type="button" class="button" id="seq-species-download" hidden>Species list (CSV)</button>
+          </div>
+          <p class="note">The complete primer-specific databases are available in the <a id="repo-link" href="#">code repository</a> and the <a id="zenodo-link" href="#">Zenodo archive</a>.</p>
+        </div>
+      </form>
+    </div>
+  </section>
+
+  <!-- About -->
+  <section id="about-section" class="about-section" aria-labelledby="about-heading">
+    <div class="wrap about-grid">
+      <div>
+        <h2 id="about-heading">About</h2>
+        <p>This site accompanies Luypaert, Farias, Hrbek, Peres &amp; Haugaasen (2026), <em>Knowledge gaps and sequencing priorities for mammalian eDNA metabarcoding in the world’s largest tropical forest country</em>, Nature Communications. The priority lists correspond to Tables S4 and S5, and the maps to Fig. 5.</p>
+        <p>Range maps are from Marsh et al. (2022), so the 48 species without a range map, mostly recently described or split rodents and primates, are listed in the table but not on the map.</p>
+        <p>Common names are from the Mammal Diversity Database. Red List categories are from the IUCN Red List (version 2025-2) and SALVE.</p>
+      </div>
+      <div class="cite">
+        <h3>How to cite</h3>
+        <p id="citation-text">Luypaert T., Farias I.P., Hrbek T., Peres C.A. &amp; Haugaasen T. (2026). Knowledge gaps and sequencing priorities for mammalian eDNA metabarcoding in the world’s largest tropical forest country. <em>Nature Communications</em>.</p>
+        <p>Code and data: <a id="zenodo-link-2" href="#">Zenodo archive</a>, <a id="repo-link-2" href="#">GitHub</a>.</p>
+        <p class="note" id="version-note"></p>
+      </div>
+    </div>
+  </section>
+
+</main>
+
+<footer class="site-footer">
+  <div class="wrap">
+    <p>Code: MIT licence. Data: CC BY 4.0, except third-party data, which remain under their original terms.</p>
+  </div>
+</footer>
+
+<script src="assets/vendor/leaflet/leaflet.js"></script>
+<script src="assets/vendor/tabulator/tabulator.min.js"></script>
+<script src="assets/js/site.js"></script>
+</body>
+</html>

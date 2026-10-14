@@ -1,0 +1,1629 @@
+---
+title: "Part 1: Prepare the data"
+author: "Thomas Luypaert"
+date: "2026-09-24"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+source(here::here("R", "io.R"))
+source(here::here("R", "figures.R"))
+```
+
+# Welcome
+
+This is Part 1 of the analysis for the paper *"Knowledge Gaps and Sequencing Priorities for Mammalian eDNA Metabarcoding in the World's Largest Tropical Forest Country"*. It follows step 0 (`0_Get_reference_data/`), in which the primer-specific reference databases are built from MIDORI2 with CRABS.
+
+In this document, we prepare the reference sequences and the associated species metadata (taxonomy, synonyms, phylogenies, conservation status, traits and range-based covariates) for all downstream analyses.
+
+**Inputs:** `data/CRABS/` (step 0). All other input data (species lists, phylogenies, traits, range maps and the population density raster) are downloaded from pinned versions on first run (see `data/README.md`). IUCN Red List data are retrieved through the IUCN API, which requires a token stored in the environment variable `IUCN_REDLIST_KEY`; the cached result in `output/cache/` is used on later runs.
+
+**Output:** `output/intermediate/1_Prepare_data.rds`, used by Parts 2-4.
+
+# 0. Priors
+
+**Load R packages:**
+
+```{r}
+
+library(here)
+library(seqinr)
+library(httr)
+library(jsonlite)
+library(curl)
+library(readxl)
+library(rgbif)
+library(rentrez)
+library(ape)
+library(rtrees)
+library(rredlist)
+library(progress)
+library(sf)
+library(terra)
+library(exactextractr)
+
+# Loaded last so that dplyr functions are not masked by functions with the
+# same name in other packages (e.g. seqinr::count)
+library(tidyverse)
+
+```
+
+**Caching of slow or online steps:**
+
+Several steps query online services (NCBI, GBIF, IUCN) or take a long time to run (grafting species onto the phylogenies). Their results are cached in `output/cache/`, and later runs load the cached results, both when knitting and when running chunks interactively. Online services change over time, so the cached files also document the exact data used in the paper. Set `rebuild_cache <- TRUE` to recompute all cached steps, or delete individual files in `output/cache/`.
+
+```{r}
+
+rebuild_cache <- FALSE
+
+needs_build <- function(name) {
+  rebuild_cache || !file.exists(cache_file(name))
+}
+
+```
+
+**Download helper for Zenodo records:**
+
+Each dataset is pinned to a specific Zenodo version record, and files are selected by name. Files already present are not downloaded again, and Zenodo is only contacted when a file is missing.
+
+```{r}
+
+# Downloads the named files of a Zenodo version record into dest_dir,
+# skipping files that are already present.
+
+download_zenodo <- function(record_id, files, dest_dir) {
+  
+  dest <- file.path(dest_dir, files)
+  missing <- !file.exists(dest)
+  
+  if (any(missing)) {
+    
+    response <- httr::GET(
+      paste0("https://zenodo.org/api/records/", record_id),
+      httr::timeout(30)
+    )
+    record <- jsonlite::fromJSON(httr::content(response, as = "text", encoding = "UTF-8"))
+    
+    # A concept record ID resolves to the latest version, so the downloaded
+    # data would change whenever a new version is published
+    if (as.character(record$id) != record_id) {
+      stop("Zenodo record ", record_id, " resolved to record ", record$id,
+           " (version ", record$metadata$version, "). Use the ID of the specific version.")
+    }
+    
+    not_in_record <- setdiff(files[missing], record$files$key)
+    if (length(not_in_record) > 0) {
+      stop("Not found in Zenodo record ", record_id, ": ", paste(not_in_record, collapse = ", "),
+           "\nAvailable files: ", paste(record$files$key, collapse = ", "))
+    }
+    
+    dir.create(dest_dir, recursive = TRUE, showWarnings = FALSE)
+    
+    for (k in which(missing)) {
+      message("Downloading ", files[k], " from Zenodo record ", record_id)
+      url <- record$files$links$self[record$files$key == files[k]]
+      curl::curl_download(url, dest[k], quiet = TRUE)
+    }
+  }
+  
+  dest
+}
+
+```
+
+# 1. Load & prepare data
+
+## 1.1. Custom reference database
+
+**Load the database:**
+
+```{r}
+
+# 1. Final CRABS output files (one per primer), named by the primer
+#    identifiers used throughout the paper (Table 1)
+
+crabs_files <- c(
+  "12S_ushio"    = "7_midori_12S_export_mimammal.fasta",
+  "12S_riaz"     = "7_midori_12S_export_riaz_degen.fasta",
+  "12S_taberlet" = "7_midori_12S_export_taberlet.fasta",
+  "16S_kitano"   = "7_midori_16S_export_kitano.fasta",
+  "16S_sarri"    = "7_midori_16S_export_sarri.fasta",
+  "16S_tabgig"   = "7_midori_16S_export_taberlet_guiget.fasta",
+  "16S_taylor"   = "7_midori_16S_export_taylor.fasta",
+  "COI_kocher"   = "7_midori_COI_export_kocher_1.fasta",
+  "COI_leray"    = "7_midori_COI_export_leray.fasta",
+  "Cytb_steuber" = "7_midori_Cytb_export_steuber.fasta"
+)
+
+database_dirs <- here("data", "CRABS", crabs_files)
+
+if (!all(file.exists(database_dirs))) {
+  stop("Reference databases not found in data/CRABS/: ",
+       paste(crabs_files[!file.exists(database_dirs)], collapse = ", "),
+       "\nRun step 0 (0_Get_reference_data/) first.")
+}
+
+# 2. Check that each file is in FASTA format
+
+is_valid_fasta <- function(file_path) {
+  first_line <- readLines(file_path, n = 1)
+  
+  if (length(first_line) == 0 || substr(first_line, 1, 1) != ">") {
+    message("File ", file_path, " is not in FASTA format (missing '>' at start).")
+    return(FALSE)
+  }
+  
+  TRUE
+}
+
+# 3. Read in the FASTA files
+
+brz_mam_eDNA <- lapply(database_dirs, function(x) {
+  if (!is_valid_fasta(x)) {
+    return(NULL)
+  }
+  
+  read.fasta(file = x, as.string = TRUE, whole.header = TRUE)
+})
+
+# 4. Name databases by primer (region_identifier)
+
+names(brz_mam_eDNA) <- names(crabs_files)
+
+# 5. Convert database headers to species names
+
+for (i in seq_along(brz_mam_eDNA)) {
+  names(brz_mam_eDNA[[i]]) <- sapply(names(brz_mam_eDNA[[i]]), function(x) {
+    gsub("_", " ", gsub("s:", "", stringr::str_split(x, pattern = ",")[[1]][7]))
+  })
+}
+
+rm(crabs_files, database_dirs, is_valid_fasta, i)
+
+```
+
+**Trace the source of sequences:**
+
+To assess the source of the MIDORI2 sequences, we randomly sampled 10% of the unique GenBank accession numbers in our curated mammal reference database and retrieved the corresponding full GenBank records via the NCBI Entrez API. Each record was checked for evidence of environmental origin (the "/environmental_sample" qualifier, or an "environmental sample" or "uncultured" organism designation), which GenBank uses to indicate sequences generated without a reliably identified source organism. Records lacking these direct indicators were then checked for evidence that they instead originated from an identified individual organism: either an explicit specimen voucher, or other indications of individual-level sampling such as an isolate identifier, tissue type, or a free-text mention of tissue or blood in the isolation source.
+
+We used this to classify each record into one of four categories: vouchered specimen, where the sequence could be linked to a formally preserved specimen; voucherless specimen, where the record indicated organism-derived material without a retrievable voucher; environmental, where the record carried evidence of environmental origin; or no source reported, where none of the relevant fields were populated.
+
+The GenBank records are retrieved once and cached, as the records themselves can be updated over time.
+
+```{r}
+
+if (needs_build("genbank_records.rds")) {
+
+  gb_metadata <- local({
+
+    batch_size    <- 200
+    sample_prop   <- 0.10
+    max_retries   <- 5
+    request_pause <- 0.34   # seconds between requests, to respect the NCBI rate limit
+    backoff_base  <- 2      # seconds; doubles with each retry
+
+    # 1. Get unique accession numbers from the curated reference database
+
+    ref_accessions <- map_dfr(names(brz_mam_eDNA), function(marker) {
+      headers <- map_chr(brz_mam_eDNA[[marker]], ~ attr(.x, "name"))
+      tibble(
+        marker    = marker,
+        accession = str_extract(headers, "^[^;]+")
+      )
+    })
+
+    message("Unique accessions: ", n_distinct(ref_accessions$accession))
+
+    # 2. Randomly sample 10% of unique accessions
+
+    set.seed(12345)
+
+    accessions <- ref_accessions %>%
+      distinct(accession) %>%
+      slice_sample(prop = sample_prop) %>%
+      pull(accession)
+
+    message("Accessions sampled: ", length(accessions))
+
+    # 3. Fetch one batch of records, retrying with exponential backoff
+
+    fetch_batch <- function(ids) {
+      for (attempt in 0:max_retries) {
+        if (attempt > 0) Sys.sleep(backoff_base * 2^(attempt - 1))
+
+        result <- tryCatch(
+          entrez_fetch(db = "nuccore", id = ids, rettype = "gb", retmode = "text"),
+          error = function(e) NULL
+        )
+
+        # entrez_fetch can return an empty string on server-side failures
+        if (!is.null(result) && nchar(result) > 0 && str_detect(result, "ACCESSION")) {
+          return(result)
+        }
+      }
+      NA_character_
+    }
+
+    # 4. Fetch records in batches
+
+    batches <- split(accessions, ceiling(seq_along(accessions) / batch_size))
+
+    pb <- progress_bar$new(
+      format = "  Retrieving [:bar] :percent | batch :current/:total | ETA: :eta",
+      total = length(batches), clear = FALSE, width = 80
+    )
+
+    gb_records_raw <- vector("list", length(batches))
+    failed_batches <- list()
+
+    for (i in seq_along(batches)) {
+      Sys.sleep(request_pause)
+      gb_records_raw[[i]] <- fetch_batch(batches[[i]])
+      if (is.na(gb_records_raw[[i]])) failed_batches <- c(failed_batches, list(batches[[i]]))
+      pb$tick()
+    }
+
+    # 5. Retry failed batches one accession at a time, as a single malformed
+    #    accession can cause a whole batch to fail
+
+    for (acc in unlist(failed_batches)) {
+      Sys.sleep(request_pause)
+      gb_records_raw <- c(gb_records_raw, fetch_batch(acc))
+    }
+
+    # 6. Split the retrieved text into individual GenBank records
+
+    records <- unlist(
+      map(gb_records_raw[!is.na(gb_records_raw)], ~ str_split(.x, pattern = "\\n//\\s*\\n")[[1]]),
+      use.names = FALSE
+    )
+    records <- records[str_detect(records, "\\bACCESSION\\s+")]
+
+    # 7. Parse metadata fields from each record
+
+    get_qualifier <- function(x, qualifier) {
+      str_match(x, paste0("/", qualifier, "=\"([^\"]*)\""))[, 2]
+    }
+
+    parse_genbank_record <- function(record) {
+      lines <- str_split(record, "\n")[[1]]
+
+      definition_start <- which(str_detect(lines, "^DEFINITION\\s+"))
+      if (length(definition_start) > 0) {
+        i <- definition_start[1]
+        following <- if (i < length(lines)) lines[(i + 1):length(lines)] else character(0)
+        continuation <- following[str_detect(following, "^\\s{12}\\S")]
+        definition <- str_squish(str_remove(paste(c(lines[i], continuation), collapse = " "),
+                                            "^DEFINITION\\s+"))
+      } else {
+        definition <- NA_character_
+      }
+
+      tibble(
+        accession             = str_match(record, "(?m)^ACCESSION\\s+(\\S+)")[, 2],
+        locus                 = str_match(record, "(?m)^LOCUS\\s+(\\S+)")[, 2],
+        definition            = definition,
+        source                = str_match(record, "(?m)^SOURCE\\s+(.+)$")[, 2],
+        organism              = str_match(record, "(?m)^\\s+ORGANISM\\s+(.+)$")[, 2],
+        # /environmental_sample is a flag without a value
+        environmental_sample  = str_detect(record, "(?m)^\\s*/environmental_sample\\s*$"),
+        specimen_voucher      = get_qualifier(record, "specimen_voucher"),
+        isolate               = get_qualifier(record, "isolate"),
+        isolation_source      = get_qualifier(record, "isolation_source"),
+        tissue_type           = get_qualifier(record, "tissue_type"),
+        mol_type              = get_qualifier(record, "mol_type"),
+        sequencing_technology = str_match(record, "Sequencing Technology\\s*::\\s*([^\\n]+)")[, 2],
+        assembly_method       = str_match(record, "Assembly Method\\s*::\\s*([^\\n]+)")[, 2]
+      )
+    }
+
+    gb_metadata <- map_dfr(records, parse_genbank_record)
+
+    # 8. Report any sampled accessions that could not be retrieved
+
+    missing_accessions <- setdiff(accessions, gb_metadata$accession)
+    message("Accessions retrieved: ", n_distinct(gb_metadata$accession),
+            " of ", length(accessions))
+    if (length(missing_accessions) > 0) {
+      warning("Could not retrieve: ", paste(missing_accessions, collapse = ", "))
+    }
+
+    gb_metadata
+  })
+
+  saveRDS(gb_metadata, cache_file("genbank_records.rds"))
+
+}
+
+```
+
+**Classify the source of each record:**
+
+Records are assigned to four categories, checked in this order:
+
+1.  *Environmental*: flagged by the /environmental_sample qualifier, an "environmental sample" or "uncultured" organism designation, or a free-text isolation source mentioning water, soil, sediment, etc.
+2.  *Vouchered specimen*: cites a specimen voucher.
+3.  *Voucherless specimen*: organism-derived (an isolate identifier, a tissue type, or a free-text mention of tissue, blood, muscle, etc.) but without a formal voucher.
+4.  *No source reported*: none of the above fields are populated.
+
+```{r}
+
+gb_metadata <- readRDS(cache_file("genbank_records.rds"))
+
+env_keywords <- "water|soil|sediment|feces|faeces|scat|swab|saliva|air sample|environmental"
+
+category_order <- c(
+  "Vouchered specimen",
+  "Voucherless specimen",
+  "No source reported",
+  "Environmental"
+)
+
+gb_metadata <- gb_metadata %>%
+  mutate(
+    source_category = case_when(
+      environmental_sample |
+        str_detect(str_to_lower(coalesce(organism, "")), "environmental sample|uncultured") |
+        str_detect(str_to_lower(coalesce(isolation_source, "")), env_keywords) ~
+        "Environmental",
+      !is.na(specimen_voucher) ~
+        "Vouchered specimen",
+      !is.na(isolate) | !is.na(tissue_type) |
+        str_detect(str_to_lower(coalesce(isolation_source, "")), "blood|tissue|muscle|skin|liver|hair") ~
+        "Voucherless specimen",
+      TRUE ~ "No source reported"
+    ),
+    source_category = factor(source_category, levels = category_order)
+  )
+
+source_summary <- gb_metadata %>%
+  dplyr::count(source_category, .drop = FALSE) %>%
+  mutate(proportion = n / sum(n))
+
+print(source_summary)
+
+specimen_share <- sum(source_summary$proportion[
+  source_summary$source_category %in% c("Vouchered specimen", "Voucherless specimen")
+])
+environmental_share <- source_summary$proportion[source_summary$source_category == "Environmental"]
+
+```
+
+**Plot the source classification (Fig. S1):**
+
+```{r}
+
+p <- ggplot(source_summary, aes(x = source_category, y = n)) +
+  geom_col(width = 0.6, fill = "#2C5F7C") +
+  geom_text(
+    aes(label = paste0(n, " (", scales::percent(proportion, accuracy = 0.1), ")")),
+    hjust = -0.08, size = 3.2, colour = "grey20"
+  ) +
+  scale_x_discrete(limits = rev(category_order)) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.28))) +
+  coord_flip() +
+  labs(x = NULL, y = "Number of records") +
+  theme_minimal(base_size = 11) +
+  theme(
+    axis.text.y = element_text(size = 10),
+    panel.grid.major.y = element_blank()
+  )
+
+print(p)
+
+save_figure(p, "FigS1_sequence_source_classification",
+            width = 7.5, height = 3.8, type = "supplementary")
+
+rm(p, env_keywords, category_order)
+
+```
+
+> **Interpretation**: `r scales::percent(specimen_share, accuracy = 0.1)` of the `r nrow(gb_metadata)` sampled records fell into the two specimen-derived categories, while `r scales::percent(environmental_share, accuracy = 0.1)` showed any evidence of environmental origin (in all cases indirect, based on free-text fields). Our MIDORI2 reference library is therefore built predominantly from specimen-derived sequence data.
+
+```{r}
+
+rm(gb_metadata, source_summary, specimen_share, environmental_share)
+
+```
+
+**Clean the database:**
+
+Species names can be uncertain, which is commonly indicated by adding "*cf.*" or "*aff.*" to the species name. We do not want to include sequences with uncertain species labels, so we remove any entries containing these components.
+
+```{r}
+
+# Remove uncertain identities ("cf." or "aff.")
+
+n_before <- sapply(brz_mam_eDNA, length)
+
+brz_mam_eDNA <- lapply(brz_mam_eDNA, function(x) {
+  uncertain <- grepl("cf.", names(x), fixed = TRUE) | grepl("aff.", names(x), fixed = TRUE)
+  x[!uncertain]
+})
+
+n_removed <- n_before - sapply(brz_mam_eDNA, length)
+print(n_removed)
+
+rm(n_before, n_removed)
+
+```
+
+## 1.2. List of mammals
+
+**Brazilian mammals:**
+
+We download the list of Brazilian mammals from Abreu et al. (2024; version 2024-1), publicly available on [Zenodo](https://zenodo.org/records/14536925).
+
+```{r}
+
+brz_list_file <- download_zenodo(
+  record_id = "14536925",
+  files     = "Mammalia_SBMz_v2024-1_Dez.xlsx",
+  dest_dir  = here("data", "Species_lists", "Brazilian_mammals_2024-1")
+)
+
+brz_mam_list <- readxl::read_excel(brz_list_file)
+
+# Remove leading, trailing and repeated spaces from the taxonomic columns
+# (columns 1-13, ending with the binomial). Names with stray spaces would
+# otherwise not match sequences, synonyms, traits, range maps or IUCN data.
+
+names_before <- brz_mam_list$BINOMIO
+brz_mam_list[1:13] <- lapply(brz_mam_list[1:13], stringr::str_squish)
+
+changed <- which(names_before != brz_mam_list$BINOMIO)
+message(length(changed), " species names contained extra spaces: ",
+        paste0('"', names_before[changed], '"', collapse = ", "))
+
+rm(brz_list_file, names_before, changed)
+
+```
+
+**Global mammals:**
+
+We also download the Mammal Diversity Database, which we use for the global perspective on sequencing priorities and to assemble a list of synonyms for Brazilian mammals.
+
+```{r}
+
+# 1. Download the Mammal Diversity Database (species table and synonyms table)
+
+mdd_files <- download_zenodo(
+  record_id = "15007505",
+  files     = c("MDD_v2.0_6759species.csv", "Species_Syn_v2.0.csv"),
+  dest_dir  = here("data", "Species_lists", "Global_mammals_v2.0")
+)
+
+# 2. Load the global mammals table, select relevant columns and rename
+
+global_mammals <- read.csv(mdd_files[1])
+
+global_mammals <- global_mammals[, c(1, 15, 22, 42, 46, 49)]
+colnames(global_mammals) <- c("binomial", "family", "first_described",
+                              "iucn_status", "former_name_1", "former_name_2")
+
+# 3. Replace underscores in names with spaces
+
+global_mammals$binomial      <- gsub("_", " ", global_mammals$binomial)
+global_mammals$former_name_1 <- gsub("_", " ", global_mammals$former_name_1)
+global_mammals$former_name_2 <- gsub("_", " ", global_mammals$former_name_2)
+
+# 4. Path to the MDD synonyms table, used in the next section
+
+mdd_synonyms_file <- mdd_files[2]
+
+rm(mdd_files)
+
+```
+
+## 1.3. Compile synonyms of Brazilian mammals
+
+The synonyms list combines the Mammal Diversity Database, GBIF and a set of manually curated synonyms. GBIF is queried online and its taxonomy is updated over time, so the finished list is cached and reused on later runs.
+
+**Get synonyms list**:
+
+```{r}
+
+build_synonyms <- needs_build("brz_mam_synonyms.rds")
+
+```
+
+```{r, results='hide', warning=FALSE, message=FALSE}
+
+if (build_synonyms) {
+
+  # 1. Load global species synonyms from MDD (synonym entries only)
+
+  global_synonyms_list <- read.csv(mdd_synonyms_file) %>%
+    select(binomial = 2, type = 8, name = 9) %>%
+    filter(type == "synonym") %>%
+    merge(global_mammals[, c("binomial", "iucn_status", "former_name_1", "former_name_2")],
+          by = "binomial")
+
+  # 2. Subset to Brazilian species
+
+  brz_synonyms_list <- global_synonyms_list %>%
+    filter(binomial %in% brz_mam_list$BINOMIO)
+
+  # 3. Combine MDD synonyms and former names for each Brazilian species
+
+  brz_mam_synonyms <- vector("list", nrow(brz_mam_list))
+  names(brz_mam_synonyms) <- brz_mam_list$BINOMIO
+
+  for (i in seq_along(brz_mam_synonyms)) {
+    df <- brz_synonyms_list[brz_synonyms_list$binomial == names(brz_mam_synonyms)[i], ]
+
+    brz_mam_synonyms[[i]] <- unique(c(
+      unlist(df$name),
+      unlist(df$former_name_1),
+      unlist(df$former_name_2)
+    ))
+  }
+
+  # 4. Add synonyms from GBIF
+
+  brz_mam_GBIF <- rgbif::name_backbone_checklist(names(brz_mam_synonyms)) %>%
+    filter(!matchType %in% c("NONE", "HIGHERRANK"))
+
+  for (i in seq_along(brz_mam_synonyms)) {
+    species <- names(brz_mam_synonyms)[i]
+
+    if (!(species %in% brz_mam_GBIF$verbatim_name)) {
+      message(species, " not found in GBIF, skipping...")
+      next
+    }
+
+    usage_key <- brz_mam_GBIF$usageKey[brz_mam_GBIF$verbatim_name == species]
+    gbif_synonyms <- rgbif::name_usage(key = usage_key, data = "synonyms")$data$canonicalName
+
+    brz_mam_synonyms[[i]] <- unique(c(species, brz_mam_synonyms[[i]], gbif_synonyms))
+  }
+
+  # 5. Manually add synonyms for species not covered by MDD or GBIF
+
+  manual_synonyms <- list(
+    "Philander quica" = c("Philander quica", "Philander frenatus"),
+    "Philander canus" = c("Philander canus", "Philander opossum canus"),
+    "Monodelphis pinocchio" = c("Monodelphis pinocchio", "Monodelphis macae", "Monodelphis species 1"),
+    "Monodelphis saci" = c("Monodelphis saci", "Monodelphis species 2"),
+    "Metachirus myosuros" = c("Metachirus myosuros", "Philander nudicaudatus myosuros"),
+    "Gracilinanus peruanus" = c("Gracilinanus peruanus", "Marmosa agilis peruana", "Marmosa agilis buenavistae"),
+    "Sylvilagus minensis" = c("Sylvilagus minensis", "Sylvilagus brasiliensis minensis"),
+    "Sylvilagus paraguensis" = c("Sylvilagus paraguensis", "Sylvilagus brasiliensis paraguensis"),
+    "Saguinus subgrisescens" = c("Saguinus subgrisescens", "Saguinus imperator subgrisescens", "Mystax imperator subgrisescens"),
+    "Cacajao novaesi" = c("Cacajao novaesi", "Cacajao calvus novaesi"),
+    "Cacajao rubicundus" = c("Cacajao rubicundus", "Cacajao calvus rubicundus"),
+    "Cacajao ucayalii" = c("Cacajao ucayalii", "Cacajao calvus ucayalii"),
+    "Guerlinguetus brasiliensis" = c("Guerlinguetus brasiliensis", "Sciurus brasiliensis"),
+    # Sciurus aestuans is assigned to G. aestuans, which carries its type
+    "Guerlinguetus aestuans" = c("Guerlinguetus aestuans", "Sciurus aestuans"),
+    "Hadrosciurus ignitus" = c("Hadrosciurus ignitus", "Sciurus ignitus"),
+    "Hadrosciurus igniventris" = c("Hadrosciurus igniventris", "Sciurus igniventris"),
+    "Hadrosciurus pyrrhinus" = c("Hadrosciurus pyrrhinus", "Sciurus pyrrhinus"),
+    "Hadrosciurus spadiceus" = c("Hadrosciurus spadiceus", "Sciurus spadiceus"),
+    "Brucepattersonius nebulosus" = c("Brucepattersonius nebulosus", "Brucepattersonius sp. B"),
+    "Daptomys ferreirai" = c("Daptomys ferreirai", "Neusticomys ferreirai"),
+    "Euryoryzomys cerqueirai" = c("Euryoryzomys cerqueirai", "Oryzomys lamia", "Oryzomys sp.", "Oryzomys lamico", "Oryzomys sp. n."),
+    "Holochilus nanus" = c("Holochilus nanus", "Holochilus brasiliensis nanus", "Holochilus sciureus nanus"),
+    "Holochilus oxe" = c("Holochilus oxe", "Holochilus brasiliensis oxe", "Holochilus sciureus oxe"),
+    "Oecomys tapajinus" = c("Oecomys tapajinus", "Oryzomys tapajinus", "Oryzomys concolor concolor", "Oryzomys marmosurus tapajinus", "Oecomys trinitatis tapajinus", "Oecomys gr. roberti", "Oecomys aff. roberti"),
+    "Rhipidomys baturiteensis" = c("Rhipidomys baturiteensis", "Rhipidomys cariri baturiteensis"),
+    "Mazama jucunda" = c("Mazama jucunda", "Mazama americana jucunda", "Mazama bororo"),
+    "Passalites nemorivagus" = c("Passalites nemorivagus", "Mazama nemorivaga"),
+    "Subulo gouazoubira" = c("Subulo gouazoubira", "Mazama gouazoubira"),
+    "Leopardus munoai" = c("Leopardus munoai", "Felis colocola munoai", "Lynchailurus braccatus munoai", "Leopardus colocola munoai"),
+    "Glossophaga bakeri" = c("Glossophaga bakeri", "Glossophaga commissarisi bakeri"),
+    "Neoeptesicus brasiliensis" = c("Neoeptesicus brasiliensis", "Eptesicus brasiliensis"),
+    "Neoeptesicus chiriquinus" = c("Neoeptesicus chiriquinus", "Eptesicus chiriquinus"),
+    "Neoeptesicus diminutus" = c("Neoeptesicus diminutus", "Eptesicus diminutus"),
+    "Neoeptesicus furinalis" = c("Neoeptesicus furinalis", "Eptesicus furinalis"),
+    "Neoeptesicus taddeii" = c("Neoeptesicus taddeii", "Eptesicus taddeii")
+  )
+
+  for (species in names(manual_synonyms)) {
+    brz_mam_synonyms[[species]] <- manual_synonyms[[species]]
+  }
+
+  brz_mam_synonyms <- lapply(brz_mam_synonyms, unique)
+
+  rm(global_synonyms_list, brz_synonyms_list, df, brz_mam_GBIF, species,
+     usage_key, gbif_synonyms, manual_synonyms, i)
+
+}
+
+```
+
+**Dealing with duplicated synonyms in the species list**
+
+Because species are split and renamed over time, species that are recognised under distinct names today can share synonyms.
+
+[To avoid downstream issues, we handle this as follows]{.underline}:
+
+1.  If the duplicated synonym is also the current binomial of one of the Brazilian mammals, we remove the synonym only from the other species.
+
+2.  If the duplicated synonym is a true synonym of all the species for which it is duplicated, we remove the synonym from all of these species.
+
+**Find duplicated synonyms:**
+
+```{r}
+
+if (build_synonyms) {
+
+  all_synonyms_table <- table(unlist(brz_mam_synonyms))
+  duplicate_synonyms <- names(all_synonyms_table[all_synonyms_table > 1])
+
+  duplicate_locations <- lapply(duplicate_synonyms, function(synonym) {
+    names(brz_mam_synonyms)[sapply(brz_mam_synonyms, function(x) synonym %in% x)]
+  })
+  names(duplicate_locations) <- duplicate_synonyms
+
+  for (synonym in names(duplicate_locations)) {
+    cat("Duplicate synonym:", synonym, "found in species:",
+        paste(duplicate_locations[[synonym]], collapse = ", "), "\n")
+  }
+
+  rm(all_synonyms_table, duplicate_synonyms, synonym)
+
+}
+
+```
+
+**Handle duplicated synonyms**:
+
+```{r}
+
+if (build_synonyms) {
+
+  for (synonym in names(duplicate_locations)) {
+
+    locations <- duplicate_locations[[synonym]]
+
+    # A synonym that is itself a current binomial is kept for that species
+    if (synonym %in% names(brz_mam_synonyms)) {
+      locations <- locations[locations != synonym]
+    }
+
+    for (location in locations) {
+      brz_mam_synonyms[[location]] <- brz_mam_synonyms[[location]][brz_mam_synonyms[[location]] != synonym]
+      message("Removed ", synonym, " from ", location, " synonyms")
+    }
+  }
+
+  # Make sure every species has at least its own name as a synonym
+
+  for (i in seq_along(brz_mam_synonyms)) {
+    if (length(brz_mam_synonyms[[i]]) == 0) {
+      brz_mam_synonyms[[i]] <- names(brz_mam_synonyms)[i]
+    }
+  }
+
+  saveRDS(brz_mam_synonyms, cache_file("brz_mam_synonyms.rds"))
+
+  rm(duplicate_locations, synonym, locations, location, i)
+
+}
+
+```
+
+**Load the synonyms list:**
+
+Several rules are enforced on the loaded list: each species includes its own accepted name, and no accepted name of a species in the checklist is listed as a synonym of another species (this applies duplicated-synonym rule 1 above to all accepted names, including those that appear in only one other species' list).
+
+Synonym lists compiled from taxonomic databases can also contain names that are currently accepted for a *different* species outside Brazil, for example historical names or homonyms. Such names are listed for review below. Synonyms confirmed as errors are removed through `excluded_synonyms`; the remaining cases are species that the Brazilian checklist treats as synonyms of a Brazilian species (lumps).
+
+```{r}
+
+brz_mam_synonyms <- readRDS(cache_file("brz_mam_synonyms.rds"))
+
+accepted_names <- names(brz_mam_synonyms)
+
+# Remove missing and empty entries (from empty fields in the MDD tables)
+
+brz_mam_synonyms <- lapply(brz_mam_synonyms, function(x) x[!is.na(x) & x != ""])
+
+# 1. Remove accepted names of other checklist species from each synonym list
+
+for (sp in accepted_names) {
+  misplaced <- intersect(brz_mam_synonyms[[sp]], setdiff(accepted_names, sp))
+  if (length(misplaced) > 0) {
+    message("Removed accepted name(s) ", paste(misplaced, collapse = ", "),
+            " from the synonyms of ", sp)
+    brz_mam_synonyms[[sp]] <- setdiff(brz_mam_synonyms[[sp]], misplaced)
+  }
+}
+
+# 2. Make sure each species includes its own accepted name
+
+own_name_missing <- accepted_names[!mapply(`%in%`, accepted_names, brz_mam_synonyms)]
+message("Added the accepted name to the synonyms of ", length(own_name_missing), " species")
+own_name_missing
+
+brz_mam_synonyms <- mapply(function(sp, syn) unique(c(sp, syn)),
+                           accepted_names, brz_mam_synonyms, SIMPLIFY = FALSE)
+
+# 3. Synonyms that are currently accepted species in the MDD, for review.
+#    Cases in a different genus are the most likely errors and are listed first.
+
+synonym_table <- stack(brz_mam_synonyms)
+synonym_table <- data.frame(species = as.character(synonym_table$ind),
+                            synonym = synonym_table$values)
+
+accepted_synonyms <- synonym_table[synonym_table$synonym %in% global_mammals$binomial &
+                                     synonym_table$synonym != synonym_table$species, ]
+accepted_synonyms$same_genus <- word(accepted_synonyms$species, 1) == word(accepted_synonyms$synonym, 1)
+accepted_synonyms <- accepted_synonyms[order(accepted_synonyms$same_genus, accepted_synonyms$species), ]
+rownames(accepted_synonyms) <- NULL
+
+accepted_synonyms
+
+# 4. Remove synonyms confirmed as errors after reviewing the table above
+
+excluded_synonyms <- list(
+  "Euphractus sexcinctus" = "Dasypus pilosus"
+)
+
+for (sp in names(excluded_synonyms)) {
+  brz_mam_synonyms[[sp]] <- setdiff(brz_mam_synonyms[[sp]], excluded_synonyms[[sp]])
+}
+
+rm(mdd_synonyms_file, build_synonyms, accepted_names, sp, misplaced, own_name_missing,
+   synonym_table, accepted_synonyms, excluded_synonyms)
+
+```
+
+## 1.4. Compile metadata
+
+**Taxonomic metadata:**
+
+```{r}
+
+brz_mam_taxonomy <- brz_mam_list[, 1:13]
+
+colnames(brz_mam_taxonomy) <- c("infraclass",
+                                "magnorder",
+                                "superorder",
+                                "order",
+                                "suborder",
+                                "infraorder",
+                                "family",
+                                "subfamily",
+                                "tribe",
+                                "genus",
+                                "subgenus",
+                                "species",
+                                "binomial")
+
+brz_mam_taxonomy <- relocate(brz_mam_taxonomy, binomial)
+
+```
+
+**Other metadata:**
+
+```{r}
+
+brz_mam_metadata <- brz_mam_list[, c(13, 20, 22:28, 30:34)]
+
+colnames(brz_mam_metadata) <- c("binomial",
+                                "year_described",
+                                "biome",
+                                "brazilian_endemic",
+                                "amazonia_endemic",
+                                "cer_caat_endemic",
+                                "atl_for_endemic",
+                                "pampa_endemic",
+                                "pantanal_endemic",
+                                "iucn_status",
+                                "cites_status",
+                                "salve_status",
+                                "diet",
+                                "locomotion")
+
+```
+
+**Organize metadata:**
+
+```{r}
+
+# 1. Biome metadata
+
+unique(unlist(stringr::str_split(brz_mam_metadata$biome, ",")))
+
+# Split into one presence/absence column per biome. The patterns include
+# the spelling variants present in the species list.
+
+brz_mam_metadata <- brz_mam_metadata %>%
+  mutate(
+    in_amazonia = ifelse(stringr::str_detect(biome, paste0(c(" Amazonia",
+                                                             "Amazônia",
+                                                             "Amazômia",
+                                                             "Amazonia"),
+                                                           collapse = "|")), 1, 0),
+    
+    in_cerrado  = ifelse(stringr::str_detect(biome, paste0(c("Cerrado",
+                                                             " Cerrado",
+                                                             "Cerrrado"),
+                                                           collapse = "|")), 1, 0),
+    
+    in_caatinga = ifelse(stringr::str_detect(biome, paste0(c(" Caatinga",
+                                                             " caatinga",
+                                                             "Caatiga",
+                                                             "Caatinga"),
+                                                           collapse = "|")), 1, 0),
+    
+    in_atl_for  = ifelse(stringr::str_detect(biome, paste0(c("Mata Atlântica",
+                                                             " Mata Atântica",
+                                                             " Mata Atlântica",
+                                                             "Mata Atântica",
+                                                             "  Mata Atlântica"),
+                                                           collapse = "|")), 1, 0),
+    
+    in_pantanal = ifelse(stringr::str_detect(biome, paste0(c("Pantanal",
+                                                             " Pantanal"),
+                                                           collapse = "|")), 1, 0),
+    
+    in_pampa    = ifelse(stringr::str_detect(biome, paste0(c("Pampa",
+                                                             " Pampa",
+                                                             "Pampas",
+                                                             " Pampas"),
+                                                           collapse = "|")), 1, 0),
+    
+    in_marine   = ifelse(stringr::str_detect(biome, paste0(c("Sistema Costeiro-Marinho",
+                                                             " Estuarino",
+                                                             " Marinho Nerítico",
+                                                             " Marinho Oceânico",
+                                                             " Sistema Costeiro-Marinho",
+                                                             "Sistema Costeiro",
+                                                             "Sistema Costeiro-Estuarino",
+                                                             "Sistema Marinho Nerítico",
+                                                             "Sistema Marinho Oceânico"),
+                                                           collapse = "|")), 1, 0)
+  ) %>%
+  select(!biome)
+
+```
+
+```{r}
+
+# 2. Endemism metadata
+
+brz_mam_metadata <- brz_mam_metadata %>%
+  mutate(
+    brazilian_endemic = case_when(
+      brazilian_endemic %in% c("Sim", "sim") ~ "Yes",
+      brazilian_endemic %in% c("Não", "não", "Nao", "nao") ~ "No",
+      brazilian_endemic == "Desconhecido" ~ "Unknown"
+    )
+  )
+
+biome_names <- list(amazonia_endemic = "Amazonia",
+                    cer_caat_endemic = "Cerrado_Caatinga",
+                    atl_for_endemic  = "Atlantic_forest",
+                    pampa_endemic    = "Pampa",
+                    pantanal_endemic = "Pantanal")
+
+brz_mam_metadata <- brz_mam_metadata %>%
+  mutate(
+    across(all_of(names(biome_names)), ~ case_when(
+      (tolower(.x) == "sim" | .x == "Caatinga, Cerrado") & cur_column() == "cer_caat_endemic" ~ "Cerrado_Caatinga",
+      .x %in% c("Cerrado", "Caatinga") & cur_column() == "cer_caat_endemic" ~ .x,
+      tolower(.x) == "sim" ~ biome_names[[cur_column()]],
+      .x == "-" ~ "No",
+      .x == "Não" ~ "No",
+      TRUE ~ .x
+    ))
+  ) %>%
+  mutate(
+    regional_endemic = case_when(
+      # NA if no endemism information for any biome
+      is.na(amazonia_endemic) & is.na(cer_caat_endemic) & is.na(atl_for_endemic) &
+        is.na(pampa_endemic) & is.na(pantanal_endemic) ~ NA_character_,
+      amazonia_endemic != "No" & !is.na(amazonia_endemic) ~ amazonia_endemic,
+      cer_caat_endemic != "No" & !is.na(cer_caat_endemic) ~ cer_caat_endemic,
+      atl_for_endemic  != "No" & !is.na(atl_for_endemic)  ~ atl_for_endemic,
+      pampa_endemic    != "No" & !is.na(pampa_endemic)    ~ pampa_endemic,
+      pantanal_endemic != "No" & !is.na(pantanal_endemic) ~ pantanal_endemic,
+      TRUE ~ "No"
+    )
+  ) %>%
+  select(-c(amazonia_endemic, cer_caat_endemic, atl_for_endemic, pampa_endemic, pantanal_endemic))
+
+rm(biome_names)
+
+```
+
+```{r}
+
+# 3. Diet metadata
+
+unique(unlist(stringr::str_split(brz_mam_metadata$diet, pattern = "/")))
+
+diet_acronyms <- c(
+  "Fr"  = "Frugivore",
+  "On"  = "Omnivore",
+  "Ps"  = "Piscivore",
+  "In"  = "Insectivore",
+  "Hb"  = "Herbivore",
+  "Myr" = "Myrmecivore",
+  "Fo"  = "Folivore",
+  "Go"  = "Gummivore",
+  "Fun" = "Fungivore",
+  "Se"  = "Seminivore",
+  "Gr"  = "Granivore",
+  "Pc"  = "Planktivore",
+  "Te"  = "Teutophage",
+  "Ca"  = "Carnivore",
+  "He"  = "Hemovore",
+  "Nec" = "Nectarivore"
+)
+
+for (abbr in names(diet_acronyms)) {
+  brz_mam_metadata <- brz_mam_metadata %>%
+    mutate(!!diet_acronyms[[abbr]] := as.integer(stringr::str_detect(diet, abbr)))
+}
+
+rm(diet_acronyms, abbr)
+
+```
+
+```{r}
+
+# 4. IUCN status, filled from the MDD where missing in the species list
+
+brz_mam_metadata <- brz_mam_metadata %>%
+  left_join(global_mammals[global_mammals$binomial %in% brz_mam_list$BINOMIO, c("binomial", "iucn_status")],
+            by = "binomial", suffix = c("_df2", "_df1")) %>%
+  mutate(iucn_status = coalesce(iucn_status_df1, iucn_status_df2)) %>%
+  select(-c(iucn_status_df1, iucn_status_df2))
+
+brz_mam_metadata$iucn_status <- substr(x = brz_mam_metadata$iucn_status, start = 1, stop = 2)
+
+# Mark missing values as "UA" (unassessed)
+
+brz_mam_metadata$iucn_status[brz_mam_metadata$iucn_status %in% c("N/", "NE")] <- "UA"
+
+unique(brz_mam_metadata$iucn_status)
+
+# 5. CITES status
+
+brz_mam_metadata$cites_status[brz_mam_metadata$cites_status == "-"] <- "None"
+brz_mam_metadata$cites_status[brz_mam_metadata$cites_status == "N/A"] <- "Missing"
+
+# 6. SALVE status (Brazilian national red list)
+
+brz_mam_metadata$salve_status[brz_mam_metadata$salve_status == "N/A"] <- "Missing"
+
+# 7. Time since first description, relative to a fixed reference year so
+#    that results do not change with the date the code is run
+
+reference_year <- 2025
+
+brz_mam_metadata$year_described <- as.numeric(brz_mam_metadata$year_described)
+brz_mam_metadata$time_since_description <- reference_year - brz_mam_metadata$year_described
+
+rm(reference_year)
+
+```
+
+**Remove marine species:**
+
+We only consider continental mammals. These include the Amazonian river dolphins and manatee, but exclude marine cetaceans and seals.
+
+```{r}
+
+marine_species <- brz_mam_metadata$binomial[brz_mam_metadata$in_marine == 1]
+
+brz_mam_metadata <- brz_mam_metadata[!brz_mam_metadata$binomial %in% marine_species, ]
+brz_mam_list     <- brz_mam_list[!brz_mam_list$BINOMIO %in% marine_species, ]
+brz_mam_synonyms <- brz_mam_synonyms[!names(brz_mam_synonyms) %in% marine_species]
+brz_mam_taxonomy <- brz_mam_taxonomy[!brz_mam_taxonomy$binomial %in% marine_species, ]
+
+message(nrow(brz_mam_taxonomy), " continental mammal species retained")
+
+rm(marine_species)
+
+```
+
+## 1.5. Prepare phylogenetic trees
+
+Phylogenetic information comes from the *PHYLACINE* database, available on [Zenodo](https://zenodo.org/records/3690867). We rename tip labels using the synonyms list, graft missing species onto 100 of the 1,000 posterior trees using `rtrees`, and compute the average phylogenetic correlation matrix across these trees.
+
+Grafting takes a while, so the curated trees are cached and reused on later runs. If the species list or synonyms change, set `rebuild_cache <- TRUE` or delete `output/cache/phylogenies.rds`.
+
+**Curate phylogenetic trees**:
+
+```{r}
+
+if (needs_build("phylogenies.rds")) {
+
+  n_trees <- 100
+
+  # 1. Download and unzip PHYLACINE
+
+  phylacine_dir <- here("data", "Phylogenetic_tree", "Phylacine_v1.2.1")
+  
+  phylacine_zip <- download_zenodo(
+    record_id = "3690867",
+    files     = "PHYLACINE_v1.2.1.zip",
+    dest_dir  = phylacine_dir
+  )
+
+  if (!dir.exists(file.path(phylacine_dir, "Data"))) {
+    unzip(zipfile = phylacine_zip, exdir = phylacine_dir)
+  }
+
+  # 2. Load the PHYLACINE trees
+
+  phylacine_tree <- ape::read.nexus(
+    file.path(phylacine_dir, "Data", "Phylogenies", "Complete_phylogeny.nex")
+  )
+
+  # 3. Rename tip labels using the synonyms list
+  #    (PHYLACINE uses underscores in species names)
+
+  synonyms_lookup <- stack(brz_mam_synonyms)
+  colnames(synonyms_lookup) <- c("Synonym", "CorrectName")
+
+  synonyms_lookup$Synonym     <- gsub(" ", "_", synonyms_lookup$Synonym)
+  synonyms_lookup$CorrectName <- gsub(" ", "_", as.character(synonyms_lookup$CorrectName))
+
+  # A tip is not renamed if its accepted name is already present in the tree:
+  # it then represents a different species in the global phylogeny (e.g. a
+  # species lumped in the Brazilian checklist), and the tip carrying the
+  # accepted name is kept for the Brazilian species.
+  
+  rename_tips <- function(tree, species_mapping) {
+    matched_names <- species_mapping$CorrectName[match(tree$tip.label, species_mapping$Synonym)]
+    rename <- !is.na(matched_names) & !(matched_names %in% tree$tip.label)
+    tree$tip.label[rename] <- matched_names[rename]
+    tree
+  }
+
+  phylacine_tree <- lapply(phylacine_tree[1:n_trees], rename_tips, species_mapping = synonyms_lookup)
+
+  # 4. Remove duplicate tip labels, which arise when two PHYLACINE species
+  #    are synonyms of the same accepted name
+
+  remove_duplicate_tips <- function(tree) {
+    duplicated_tips <- duplicated(tree$tip.label)
+    if (any(duplicated_tips)) {
+      tree <- ape::drop.tip(tree, tree$tip.label[duplicated_tips])
+    }
+    tree
+  }
+
+  phylacine_tree <- lapply(phylacine_tree, remove_duplicate_tips)
+
+  # 5. Build the species table used by rtrees for grafting missing species
+
+  tree_df <- sp_list_df(
+    sp_list = unique(c(brz_mam_taxonomy$binomial, global_mammals$binomial)),
+    taxon   = "mammal"
+  )
+
+  taxonomy_all <- bind_rows(
+    brz_mam_taxonomy[, c("binomial", "family")],
+    global_mammals[, c("binomial", "family")]
+  ) %>%
+    arrange(binomial, desc(family %in% brz_mam_taxonomy$family)) %>%
+    group_by(binomial) %>%
+    slice(1) %>%
+    ungroup()
+
+  missing_families <- taxonomy_all[
+    taxonomy_all$binomial %in% gsub("_", " ", tree_df$species[is.na(tree_df$family)]),
+  ]
+
+  for (i in seq_len(nrow(missing_families))) {
+    tree_df$family[tree_df$species == gsub(" ", "_", missing_families$binomial[i])] <-
+      missing_families$family[i]
+  }
+
+  # PHYLACINE contains Sciurus aestuans (renamed to Guerlinguetus aestuans);
+  # G. brasiliensis is grafted next to it
+  
+  tree_df$close_sp <- NA
+  tree_df$close_sp[tree_df$species == "Guerlinguetus_brasiliensis"] <- "Guerlinguetus aestuans"
+
+  # 6. Graft missing species onto each tree
+
+  phylacine_tree_grafted <- vector("list", n_trees)
+
+  for (i in seq_len(n_trees)) {
+    message("Grafting tree ", i, " of ", n_trees)
+
+    phylacine_tree_grafted[[i]] <- get_tree(
+      sp_list      = tree_df,
+      tree         = phylacine_tree[[i]],
+      taxon        = "mammal",
+      show_grafted = TRUE,
+      tree_by_user = TRUE
+    )
+  }
+
+  # 7. Remove the grafting markers ("*") from tip labels and replace
+  #    underscores with spaces
+
+  phylacine_tree_grafted <- lapply(phylacine_tree_grafted, function(tree) {
+    tree$tip.label <- gsub("*", "", gsub("_", " ", tree$tip.label), fixed = TRUE)
+    tree
+  })
+
+  # 8. Average phylogenetic correlation matrix across trees
+  #    (rows and columns are aligned by species name before summing)
+
+  compute_average_vcv <- function(trees) {
+    species <- sort(trees[[1]]$tip.label)
+    vcv_sum <- 0
+    for (tree in trees) {
+      vcv_sum <- vcv_sum + ape::vcv.phylo(tree, corr = TRUE)[species, species]
+    }
+    vcv_sum / length(trees)
+  }
+
+  phylacine_average_vcv_matrix <- compute_average_vcv(phylacine_tree_grafted)
+
+  # 9. Subset the matrix to Brazilian species
+
+  phylacine_average_vcv_matrix_brz <-
+    phylacine_average_vcv_matrix[brz_mam_taxonomy$binomial, brz_mam_taxonomy$binomial]
+
+  # 10. Brazilian-only trees
+
+  brz_mam_tree <- lapply(phylacine_tree_grafted, function(tree) {
+    ape::drop.tip(tree, setdiff(tree$tip.label, unique(brz_mam_taxonomy$binomial)))
+  })
+
+  # 11. Cache the results
+
+  saveRDS(
+    list(
+      phylacine_tree_grafted           = phylacine_tree_grafted,
+      phylacine_average_vcv_matrix_brz = phylacine_average_vcv_matrix_brz,
+      brz_mam_tree                     = brz_mam_tree
+    ),
+    cache_file("phylogenies.rds")
+  )
+
+  rm(n_trees, phylacine_dir, phylacine_zip, phylacine_tree, synonyms_lookup, rename_tips,
+     remove_duplicate_tips, tree_df, taxonomy_all, missing_families, i,
+     compute_average_vcv, phylacine_average_vcv_matrix,
+     phylacine_tree_grafted, phylacine_average_vcv_matrix_brz, brz_mam_tree)
+
+}
+
+```
+
+**Load the curated trees:**
+
+```{r}
+
+list2env(readRDS(cache_file("phylogenies.rds")), envir = environment())
+
+```
+
+## 1.6. Download latest global IUCN data
+
+We retrieve the IUCN Red List category for all Brazilian species and for all species in the global phylogeny. This requires one API query per species and takes several hours, so the results are cached. The access date should be reported with the results.
+
+**Query the IUCN Red List:**
+
+```{r}
+
+if (needs_build("iucn_data.rds")) {
+
+  # 1. Retrieve the latest IUCN Red List category for a species
+
+  get_iucn_status <- function(name) {
+    genus   <- stringr::str_split(name, " ")[[1]][1]
+    species <- stringr::str_split(name, " ")[[1]][2]
+
+    tryCatch({
+      result <- rredlist::rl_species(genus = genus, species = species)[[2]]
+
+      if (length(result) == 0) {
+        return(NA)
+      }
+
+      assessment_id <- result[result$latest == TRUE, ]$assessment_id[1]
+      rredlist::rl_assessment(assessment_id)[["red_list_category"]][[3]]
+
+    }, error = function(e) {
+      # Authentication, rate-limit and server errors stop the query, so that
+      # failed look-ups are not recorded as unassessed species
+      if (grepl("HTTP (401|403|429|5[0-9]{2})", e$message)) {
+        stop("IUCN query failed for ", name, ": ", e$message,
+             "\nCheck the IUCN_REDLIST_KEY token and the connection, then rerun.")
+      }
+      message("No IUCN record retrieved for: ", name, " - ", e$message)
+      NA
+    })
+  }
+
+  query_iucn <- function(names) {
+    sapply(names, function(x) {
+      result <- get_iucn_status(x)
+      Sys.sleep(1)
+      result
+    })
+  }
+
+  # 2. Query Brazilian mammals and all species in the global phylogeny
+
+  iucn_brz    <- query_iucn(brz_mam_taxonomy$binomial)
+  iucn_global <- query_iucn(phylacine_tree_grafted[[1]]$tip.label)
+
+  # 3. For Brazilian species without a result, query their synonyms and take
+  #    the most frequent category
+
+  status_from_synonyms <- function(name) {
+    synonyms <- brz_mam_synonyms[[name]]
+    synonyms <- synonyms[stringr::str_count(synonyms, "\\S+") == 2]
+    status <- na.omit(unlist(query_iucn(synonyms)))
+    if (length(status) == 0) {
+      return(NA)
+    }
+    freq <- table(status)
+    message("Found conservation status for ", name, " via synonyms")
+    names(freq)[which.max(freq)]
+  }
+
+  missing_status <- is.na(iucn_brz)
+  iucn_brz[missing_status] <- sapply(names(iucn_brz)[missing_status], status_from_synonyms)
+
+  # 4. Combine into data frames; species without an assessment are "UA"
+
+  iucn_data_brz <- data.frame(
+    binomial    = brz_mam_taxonomy$binomial,
+    iucn_status = iucn_brz
+  )
+  iucn_data_brz$iucn_status[is.na(iucn_data_brz$iucn_status)] <- "UA"
+
+  iucn_data_global <- data.frame(
+    binomial    = phylacine_tree_grafted[[1]]$tip.label,
+    iucn_status = iucn_global
+  )
+  iucn_data_global$iucn_status[is.na(iucn_data_global$iucn_status)] <- "UA"
+
+  # Brazilian results (including synonym look-ups) take precedence
+
+  iucn_data_global <- iucn_data_global %>%
+    left_join(iucn_data_brz, by = "binomial", suffix = c("", "_new")) %>%
+    mutate(iucn_status = coalesce(iucn_status_new, iucn_status)) %>%
+    select(-iucn_status_new)
+
+  # Replace outdated IUCN codes
+
+  iucn_data_global$iucn_status <- gsub("LR/nt", "NT", iucn_data_global$iucn_status)
+
+  # 5. Cache the results
+
+  saveRDS(
+    list(iucn_data_brz = iucn_data_brz, iucn_data_global = iucn_data_global),
+    cache_file("iucn_data.rds")
+  )
+
+  rm(get_iucn_status, query_iucn, status_from_synonyms, missing_status,
+     iucn_brz, iucn_global, iucn_data_brz, iucn_data_global)
+
+}
+
+```
+
+**Load the IUCN data and add to the metadata:**
+
+```{r}
+
+list2env(readRDS(cache_file("iucn_data.rds")), envir = environment())
+
+brz_mam_metadata <- brz_mam_metadata %>%
+  select(-iucn_status) %>%
+  merge(iucn_data_brz, by = "binomial")
+
+brz_mam_metadata$iucn_status <- gsub("NA", "LC", brz_mam_metadata$iucn_status)
+
+```
+
+## 1.7. Additional traits data
+
+We add body mass and range size from the TetrapodTraits database (Moura et al. 2024), version 1.0.1, available on [Zenodo](https://zenodo.org/records/11303604). We use the main trait table (`TetrapodTraits_1.0.0.csv`), not the imputed trait sets. Missing trait values are imputed within the models in Part 3.
+
+**Download the TetrapodTraits database:**
+
+```{r}
+
+traits_file <- download_zenodo(
+  record_id = "11303604",
+  files     = "TetrapodTraits_1.0.0.csv",
+  dest_dir  = here("data", "Traits", "1.0.1")
+)
+
+traits_TTdb <- readr::read_csv(file = traits_file)
+
+rm(traits_file)
+
+```
+
+**Curate the TetrapodTraits database:**
+
+```{r}
+
+# 1. Keep only Brazilian mammal species (including synonyms)
+
+traits_TTdb <- traits_TTdb[traits_TTdb$Scientific.Name %in% unlist(brz_mam_synonyms), ]
+
+n_found <- length(unique(traits_TTdb$Scientific.Name))
+message("Found ", n_found, " species with traits in TetrapodTraits out of ",
+        length(brz_mam_synonyms), " Brazilian mammal species (",
+        round(n_found / length(brz_mam_synonyms) * 100, 2), "%)")
+
+rm(n_found)
+
+```
+
+```{r}
+
+# 2. Assign the accepted name to each TetrapodTraits entry
+
+synonym_to_accepted <- stack(brz_mam_synonyms)
+synonym_to_accepted$ind <- as.character(synonym_to_accepted$ind)
+synonym_to_accepted <- synonym_to_accepted[!duplicated(synonym_to_accepted$values), ]
+
+traits_TTdb$correct_names <- synonym_to_accepted$ind[match(traits_TTdb$Scientific.Name,
+                                                           synonym_to_accepted$values)]
+
+rm(synonym_to_accepted)
+
+```
+
+```{r}
+
+# 3. Resolve duplicates: where several entries map to the same accepted name,
+#    keep the entry listed under the accepted name, otherwise the first entry
+
+unique_entries <- traits_TTdb %>%
+  group_by(correct_names) %>%
+  filter(n() == 1) %>%
+  ungroup()
+
+filtered_duplicates <- traits_TTdb %>%
+  group_by(correct_names) %>%
+  filter(n() > 1) %>%
+  mutate(keep_row = Scientific.Name %in% names(brz_mam_synonyms)) %>%
+  filter(if (any(keep_row)) keep_row else row_number() == 1) %>%
+  ungroup() %>%
+  select(-keep_row)
+
+traits_TTdb <- bind_rows(unique_entries, filtered_duplicates) %>%
+  select(!Scientific.Name) %>%
+  rename(binomial = correct_names) %>%
+  relocate(binomial)
+
+rm(unique_entries, filtered_duplicates)
+
+```
+
+```{r}
+
+# 4. Keep the traits used in the models and add them to the metadata
+
+traits_TTdb <- traits_TTdb[, c("binomial", "BodyMass_g", "RangeSize")]
+
+brz_mam_metadata <- left_join(brz_mam_metadata, traits_TTdb, by = "binomial")
+
+rm(traits_TTdb)
+
+```
+
+## 1.8. Human population density in species ranges
+
+We extract the 95th percentile of human population density within each species' range, as a measure of proximity to human settlements. Population density comes from the WorldPop unconstrained population density estimates for Brazil in 2020, at 30 arc-second (\~1 km) resolution. The raster covers Brazil only, so the percentile is computed over the Brazilian portion of each species' range.
+
+For species ranges, we use the expert range maps of Marsh et al. (2022, *Journal of Biogeography* 49: 979-992), harmonised to the Mammal Diversity Database v1.2 taxonomy and available on [Zenodo](https://zenodo.org/records/6644198). The maps are distributed as one file per order; we download the orders that include Brazilian species.
+
+**Download the range maps:**
+
+```{r}
+
+range_map_dir <- here("data", "Range_maps", "MDD_v1.2")
+dir.create(range_map_dir, recursive = TRUE, showWarnings = FALSE)
+
+range_map_orders <- c("Artiodactyla", "Carnivora", "Chiroptera", "Cingulata",
+                      "Didelphimorphia", "Lagomorpha", "Perissodactyla", "Pilosa",
+                      "Primates", "Rodentia", "Sirenia")
+
+range_map_files <- file.path(range_map_dir, paste0("MDD_", range_map_orders, ".gpkg"))
+
+# Download and unzip only the orders not already present
+
+missing_orders <- range_map_orders[!file.exists(range_map_files)]
+
+if (length(missing_orders) > 0) {
+  
+  range_zips <- download_zenodo(
+    record_id = "6644198",
+    files     = paste0("MDD_", missing_orders, ".zip"),
+    dest_dir  = range_map_dir
+  )
+  
+  for (zip_file in range_zips) {
+    unzip(zip_file, exdir = range_map_dir, junkpaths = TRUE)
+    unlink(zip_file)
+  }
+  
+  rm(range_zips, zip_file)
+}
+
+if (!all(file.exists(range_map_files))) {
+  stop("Range maps not found after unzipping: ",
+       paste(basename(range_map_files)[!file.exists(range_map_files)], collapse = ", "))
+}
+
+rm(missing_orders, range_map_orders)
+
+```
+
+We also record which species lack a range map, as these are absent from the spatial analyses in Part 4.
+
+**Download the population density raster:**
+
+```{r}
+
+popdens_file <- here("data", "Environmental_variables", "bra_pd_2020_1km.tif")
+
+if (!file.exists(popdens_file)) {
+  message("Downloading WorldPop population density for Brazil (2020)")
+  dir.create(dirname(popdens_file), recursive = TRUE, showWarnings = FALSE)
+  curl::curl_download(
+    "https://data.worldpop.org/GIS/Population_Density/Global_2000_2020_1km/2020/BRA/bra_pd_2020_1km.tif",
+    popdens_file,
+    quiet = TRUE
+  )
+}
+
+```
+
+**Extract human population density within species ranges:**
+
+Each range map file covers all species of an order globally and can be large. We therefore read one file at a time, and from each file only the polygons of Brazilian species (matched on their names and synonyms), so the global polygons are never loaded into memory. The results are cached.
+
+```{r}
+
+# 1. Map names (accepted names and synonyms) to accepted names
+
+syn_map <- unlist(lapply(names(brz_mam_synonyms), function(x) {
+  setNames(rep(x, length(brz_mam_synonyms[[x]])), brz_mam_synonyms[[x]])
+}))
+
+if (needs_build("range_popdens.rds")) {
+  
+  # 2. Human population density raster
+  
+  popdens <- rast(popdens_file)
+  
+  # 3. Range map files (one per order)
+  
+  range_files <- range_map_files
+  
+  # 4. Read only the polygons of the named species from a GeoPackage
+  
+  read_ranges <- function(gpkg_path, names_to_keep) {
+    layer <- st_layers(gpkg_path)$name[1]
+    name_list <- paste0("'", gsub("'", "''", names_to_keep, fixed = TRUE), "'", collapse = ", ")
+    st_read(gpkg_path, quiet = TRUE,
+            query = paste0('SELECT * FROM "', layer, '" WHERE sciname IN (', name_list, ')'))
+  }
+  
+  # 5. Merge the ranges of map species that correspond to a single accepted
+  #    species (species recognised in the range maps but treated as synonyms
+  #    in the Brazilian checklist)
+  
+  merge_synonym_ranges <- function(polygons) {
+    polygons$binomial <- unname(syn_map[polygons$sciname])
+    shared <- polygons$binomial %in% polygons$binomial[duplicated(polygons$binomial)]
+    if (!any(shared)) {
+      return(polygons[, c("sciname", "binomial")])
+    }
+    merged <- polygons[shared, ] %>%
+      st_make_valid() %>%
+      group_by(binomial) %>%
+      summarise(sciname = paste(sort(unique(sciname)), collapse = "; "), .groups = "drop")
+    message("  Merged ranges: ", paste(merged$sciname, collapse = " | "))
+    rbind(polygons[!shared, c("sciname", "binomial")], merged[, c("sciname", "binomial")])
+  }
+  
+  # 6. 95th percentile of population density within each species' range,
+  #    processing one file at a time
+  
+  range_popdens <- vector("list", length(range_files))
+  
+  for (k in seq_along(range_files)) {
+    polygons <- read_ranges(range_files[k], names(syn_map))
+    message(basename(range_files[k]), ": ", nrow(polygons), " polygons of Brazilian species")
+    
+    if (nrow(polygons) > 0) {
+      polygons <- merge_synonym_ranges(polygons)
+      range_popdens[[k]] <- data.frame(
+        sciname  = polygons$sciname,
+        binomial = polygons$binomial,
+        density  = exact_extract(popdens, polygons, "quantile", quantiles = 0.95, progress = FALSE)
+      )
+    }
+    
+    rm(polygons)
+    gc()
+  }
+  
+  range_popdens <- do.call(rbind, range_popdens)
+  
+  saveRDS(range_popdens, cache_file("range_popdens.rds"))
+  
+  rm(popdens, range_files, read_ranges, merge_synonym_ranges, k)
+}
+
+range_popdens <- readRDS(cache_file("range_popdens.rds"))
+
+rm(popdens_file)
+
+```
+
+**Add to the metadata:**
+
+```{r}
+
+# 1. Species without a range map
+
+species_without_range_map <- setdiff(brz_mam_taxonomy$binomial, range_popdens$binomial)
+
+message(length(species_without_range_map), " of ", nrow(brz_mam_taxonomy),
+        " species have no range map")
+
+# 2. Add population density to the metadata
+
+hum_pop_in_range <- na.omit(range_popdens[, c("binomial", "density")])
+colnames(hum_pop_in_range) <- c("binomial", "hum_pop_range")
+
+if (any(duplicated(hum_pop_in_range$binomial))) {
+  stop("Several range maps match the same species: ",
+       paste(unique(hum_pop_in_range$binomial[duplicated(hum_pop_in_range$binomial)]),
+             collapse = ", "))
+}
+
+brz_mam_metadata <- merge(brz_mam_metadata, hum_pop_in_range, by = "binomial", all.x = TRUE)
+
+rm(syn_map, range_popdens, hum_pop_in_range)
+
+# Paths relative to the project folder, for use in Part 4
+
+range_map_files <- file.path("data", "Range_maps", "MDD_v1.2", basename(range_map_files))
+rm(range_map_dir)
+
+```
+
+# 2. Save outputs for the next steps
+
+```{r}
+
+save_step("1_Prepare_data", c(
+  "brz_mam_eDNA",
+  "brz_mam_synonyms",
+  "brz_mam_taxonomy",
+  "brz_mam_metadata",
+  "brz_mam_tree",
+  "phylacine_tree_grafted",
+  "phylacine_average_vcv_matrix_brz",
+  "iucn_data_brz",
+  "iucn_data_global",
+  "species_without_range_map",
+  "range_map_files"
+))
+
+```
+
+This completes the data preparation. The next step is `2_Assess_completeness_ambiguity_complementarity.Rmd`.
+
+```{r}
+
+sessionInfo()
+
+```

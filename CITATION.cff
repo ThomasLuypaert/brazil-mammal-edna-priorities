@@ -1,0 +1,52 @@
+cff-version: 1.2.0
+message: "If you use this code or data, please cite the article and this archive."
+title: "Code and data for: Knowledge gaps and sequencing priorities for mammalian eDNA metabarcoding in the world's largest tropical forest country"
+version: "1.0.0"
+date-released: "2026-10-14"
+license: MIT
+url: "https://thomasluypaert.github.io/brazil-mammal-edna-priorities/"
+repository-code: "https://github.com/ThomasLuypaert/brazil-mammal-edna-priorities"
+doi: "10.5281/zenodo.23365811"
+keywords:
+  - eDNA metabarcoding
+  - reference databases
+  - sequencing prioritisation
+  - evolutionary distinctiveness
+  - Brazilian mammals
+authors:
+  - family-names: Luypaert
+    given-names: Thomas
+    orcid: "https://orcid.org/0000-0001-7491-7418"
+    affiliation: "Norwegian University of Life Sciences"
+  - family-names: Farias
+    given-names: Izeni Pires
+    orcid: "https://orcid.org/0000-0002-1416-4351"
+    affiliation: "Federal University of Amazonas"
+  - family-names: Hrbek
+    given-names: Tomas
+    orcid: "https://orcid.org/0000-0003-3239-7068"
+    affiliation: "Federal University of Amazonas; Trinity University"
+  - family-names: Peres
+    given-names: Carlos A.
+    orcid: "https://orcid.org/0000-0002-1588-8765"
+    affiliation: "University of East Anglia; Instituto Juruá"
+  - family-names: Haugaasen
+    given-names: Torbjørn
+    orcid: "https://orcid.org/0000-0003-0901-5324"
+    affiliation: "Norwegian University of Life Sciences"
+preferred-citation:
+  type: article
+  title: "Knowledge gaps and sequencing priorities for mammalian eDNA metabarcoding in the world's largest tropical forest country"
+  journal: "Nature Communications"
+  year: 2026
+  authors:
+    - family-names: Luypaert
+      given-names: Thomas
+    - family-names: Farias
+      given-names: Izeni Pires
+    - family-names: Hrbek
+      given-names: Tomas
+    - family-names: Peres
+      given-names: Carlos A.
+    - family-names: Haugaasen
+      given-names: Torbjørn
