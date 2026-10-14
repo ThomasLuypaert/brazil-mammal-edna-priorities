@@ -189,6 +189,129 @@ message(sum(!is.na(links$wikipedia)), " species with a Wikipedia page, ",
 
 ```
 
+**Species photos:**
+
+One photo per species, shown as a thumbnail in the website's priority list. Photos come from iNaturalist (the species' featured photo, or another of its photos if the featured one is not openly licensed) and, for species without one, from Wikimedia Commons (the Wikidata image of the taxon, property P18). Only openly licensed photos are used (CC0, CC BY, CC BY-SA, CC BY-NC, CC BY-NC-SA, public domain), and each is credited on the website. Species without a photo get a placeholder. Both are online queries, so the results are cached.
+
+Photos can be replaced or removed by hand in `photo_overrides` (for example a misidentified photo); set `image_url` to `NA` to show the placeholder instead.
+
+```{r}
+
+photo_overrides <- tibble::tribble(
+  ~binomial, ~image_url, ~credit, ~page
+  # "Genus species", "https://…/photo.jpg", "(c) Name, CC BY", "https://…",
+)
+
+open_licences_inat <- c("cc0", "cc-by", "cc-by-sa", "cc-by-nc", "cc-by-nc-sa")
+ua <- httr::user_agent("Brazilian mammal sequencing priorities (research website; https://github.com/ThomasLuypaert/brazil-mammal-edna-priorities)")
+
+# GET a JSON API, with retries (and a longer pause when rate-limited)
+get_json <- function(url, query = list()) {
+  for (attempt in 1:3) {
+    res <- tryCatch(httr::GET(url, query = query, ua, httr::timeout(60)), error = function(e) NULL)
+    if (!is.null(res) && httr::status_code(res) == 200)
+      return(jsonlite::fromJSON(httr::content(res, as = "text", encoding = "UTF-8"), simplifyVector = FALSE))
+    Sys.sleep(if (!is.null(res) && httr::status_code(res) == 429) 60 else 5)
+  }
+  NULL
+}
+
+if (needs_build("website_photos.rds")) {
+
+  # 1. iNaturalist: match the species name (or a synonym iNaturalist knows), mammals only
+
+  inat_photo <- function(name) {
+    Sys.sleep(1.1)   # iNaturalist asks for at most 60 requests per minute
+    hits <- get_json("https://api.inaturalist.org/v1/taxa",
+                     list(q = name, rank = "species", per_page = 10))$results
+    is_match <- function(t) identical(t$iconic_taxon_name, "Mammalia") &&
+      (tolower(t$name) == tolower(name) || tolower(t$matched_term %||% "") == tolower(name))
+    taxon <- Find(is_match, hits)
+    if (is.null(taxon)) return(NULL)
+
+    is_open <- function(p) !is.null(p) && tolower(p$license_code %||% "") %in% open_licences_inat
+    photo <- taxon$default_photo
+    if (!is_open(photo)) {
+      Sys.sleep(1.1)
+      details <- get_json(paste0("https://api.inaturalist.org/v1/taxa/", taxon$id))$results
+      photos  <- lapply(details[[1]]$taxon_photos %||% list(), `[[`, "photo")
+      photo   <- Find(is_open, photos)
+    }
+    if (is.null(photo)) return(NULL)
+
+    url <- photo$medium_url %||% photo$url
+    data.frame(binomial  = name,
+               source    = "iNaturalist",
+               image_url = sub("/(square|thumb|medium|large|original)\\.", "/small.", url),
+               credit    = photo$attribution %||% "iNaturalist",
+               page      = paste0("https://www.inaturalist.org/photos/", photo$id))
+  }
+
+  names_all <- brz_mam_taxonomy$binomial
+  inat <- bind_rows(lapply(seq_along(names_all), function(i) {
+    if (i %% 50 == 0) message("iNaturalist: ", i, " of ", length(names_all))
+    inat_photo(names_all[i])
+  }))
+
+  # 2. Wikimedia Commons, for species without an iNaturalist photo
+
+  remaining <- setdiff(names_all, inat$binomial)
+
+  wikidata_images <- function(names) {
+    values <- paste0('"', names, '"', collapse = " ")
+    query <- paste0('SELECT ?name ?image WHERE { VALUES ?name { ', values, ' } ',
+                    '?item wdt:P225 ?name . ?item wdt:P18 ?image . }')
+    rows <- get_json("https://query.wikidata.org/sparql", list(query = query, format = "json"))$results$bindings
+    if (length(rows) == 0) return(data.frame(binomial = character(), file = character()))
+    data.frame(binomial = vapply(rows, function(r) r$name$value, ""),
+               file     = vapply(rows, function(r) URLdecode(sub(".*/Special:FilePath/", "", r$image$value)), ""))
+  }
+
+  commons_photo <- function(name, file) {
+    Sys.sleep(0.5)
+    info <- get_json("https://commons.wikimedia.org/w/api.php",
+                     list(action = "query", titles = paste0("File:", file), prop = "imageinfo",
+                          iiprop = "url|extmetadata", iiurlwidth = 240, format = "json"))
+    ii <- info$query$pages[[1]]$imageinfo[[1]]
+    if (is.null(ii)) return(NULL)
+    licence <- ii$extmetadata$LicenseShortName$value %||% ""
+    if (!grepl("^(CC0|CC BY|Public domain|PD)", licence, ignore.case = TRUE) || grepl("ND", licence)) return(NULL)
+    artist <- trimws(gsub("\\s+", " ", gsub("<[^>]+>", "", ii$extmetadata$Artist$value %||% "Unknown author")))
+    data.frame(binomial  = name,
+               source    = "Wikimedia Commons",
+               image_url = ii$thumburl %||% ii$url,
+               credit    = paste0(substr(artist, 1, 80), ", ", licence, " (Wikimedia Commons)"),
+               page      = ii$descriptionurl)
+  }
+
+  batches <- split(remaining, ceiling(seq_along(remaining) / 100))
+  wd <- bind_rows(lapply(batches, function(b) { Sys.sleep(1); wikidata_images(b) })) %>%
+    distinct(binomial, .keep_all = TRUE)
+  commons <- bind_rows(Map(commons_photo, wd$binomial, wd$file))
+
+  photos <- bind_rows(inat, commons)
+  saveRDS(photos, cache_file("website_photos.rds"))
+
+  rm(inat_photo, names_all, inat, remaining, wikidata_images, commons_photo, batches, wd, commons, photos)
+}
+
+photos <- readRDS(cache_file("website_photos.rds"))
+
+# Manual corrections
+photos <- photos %>%
+  filter(!binomial %in% photo_overrides$binomial) %>%
+  bind_rows(photo_overrides %>% filter(!is.na(image_url)) %>% mutate(source = "manual"))
+
+message(nrow(photos), " species with a photo (",
+        sum(photos$source == "iNaturalist"), " iNaturalist, ",
+        sum(photos$source == "Wikimedia Commons"), " Wikimedia Commons, ",
+        sum(photos$source == "manual"), " manual); ",
+        nrow(brz_mam_taxonomy) - nrow(photos), " without")
+
+rm(photo_overrides, open_licences_inat)
+
+```
+
 **Build the species table:**
 
 Species are numbered in alphabetical order; the numbers link the species table to the grid cells and the sequences.
@@ -220,6 +343,40 @@ stopifnot(nrow(site_species) == nrow(brz_mam_taxonomy), !any(duplicated(site_spe
 
 species_id <- setNames(site_species$id, site_species$binomial)
 
+# Thumbnails are stored with the website (docs/img/species/<species number>.<ext>),
+# so the site does not depend on the photo sources being online
+img_dir <- here("docs", "img", "species")
+dir.create(img_dir, recursive = TRUE, showWarnings = FALSE)
+
+download_photo <- function(url, id) {
+  ext <- tolower(tools::file_ext(sub("\\?.*$", "", url)))
+  if (!ext %in% c("jpg", "jpeg", "png", "webp")) ext <- "jpg"
+  dest <- file.path(img_dir, paste0(id, ".", ext))
+  if (!file.exists(dest)) {
+    Sys.sleep(0.3)
+    ok <- tryCatch(httr::status_code(httr::GET(url, ua, httr::timeout(60),
+                                               httr::write_disk(dest, overwrite = TRUE))) == 200,
+                   error = function(e) FALSE)
+    if (!ok) { unlink(dest); return(NA_character_) }
+  }
+  paste0("img/species/", basename(dest))
+}
+
+photos <- photos %>%
+  mutate(id = unname(species_id[binomial])) %>%
+  filter(!is.na(id))
+photos$image <- as.character(unlist(Map(download_photo, photos$image_url, photos$id)))
+
+# Remove thumbnails of species that no longer have a photo
+stale <- setdiff(list.files(img_dir), basename(na.omit(photos$image)))
+unlink(file.path(img_dir, stale))
+
+site_species <- site_species %>%
+  left_join(photos %>% filter(!is.na(image)) %>% select(binomial, image, credit, page), by = "binomial")
+
+message(sum(!is.na(site_species$image)), " thumbnails, ",
+        round(sum(file.size(list.files(img_dir, full.names = TRUE))) / 1e6, 1), " MB")
+
 # Short field names keep the file small; see docs/assets/js/site.js
 species_json <- lapply(seq_len(nrow(site_species)), function(i) {
   s <- site_species[i, ]
@@ -235,13 +392,16 @@ species_json <- lapply(seq_len(nrow(site_species)), function(i) {
     np = unbox(s$n_primers),
     w = unbox(if (is.na(s$wikipedia)) NA else s$wikipedia),
     gb = unbox(if (is.na(s$gbif_key)) NA else as.integer(s$gbif_key)),
-    rm = unbox(s$has_range_map)
+    rm = unbox(s$has_range_map),
+    im = unbox(if (is.na(s$image)) NA else s$image),
+    ic = unbox(if (is.na(s$image)) NA else s$credit),
+    ip = unbox(if (is.na(s$image)) NA else s$page)
   )
 })
 
 write_json_compact(list(species = species_json), file.path(data_dir, "species.json"))
 
-rm(primers_with_sequence, species_json, common_names, links)
+rm(primers_with_sequence, species_json, common_names, links, photos, img_dir, download_photo, stale, get_json, ua)
 
 ```
 

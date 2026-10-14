@@ -67,6 +67,17 @@
     return out.join("");
   }
 
+  // Species photo (credited, links to the original) or the placeholder
+  const NO_PHOTO = "assets/img/no-photo.svg";
+  function thumb(sp, size = 44) {
+    if (sp.im) {
+      return `<a class="thumb" href="${escapeHtml(sp.ip || sp.im)}" target="_blank" rel="noopener" title="${escapeHtml(sp.ic || "")}">` +
+        `<img src="${escapeHtml(sp.im)}" alt="Photo of ${escapeHtml(sp.b)}" width="${size}" height="${size}" loading="lazy" ` +
+        `onerror="this.onerror=null;this.src='${NO_PHOTO}';this.alt=''"></a>`;
+    }
+    return `<span class="thumb none" title="No openly licensed photo available"><img src="${NO_PHOTO}" alt="" width="${size}" height="${size}"></span>`;
+  }
+
   async function getJSON(path) {
     const res = await fetch(path);
     if (!res.ok) throw new Error(`Could not load ${path} (${res.status})`);
@@ -282,11 +293,11 @@
     for (const s of list) {
       const g = CATEGORY_ORDER[best(s)];
       if (g !== lastGroup) { html += `<li class="group-heading">${g}</li>`; lastGroup = g; }
-      html += `<li>
+      html += `<li class="sp-item">${thumb(s, 48)}<div>
         <div><span class="sp-name">${escapeHtml(s.b)}</span>${s.c ? ` <span class="sp-common">${escapeHtml(s.c)}</span>` : ""}</div>
         <div class="sp-line">${chip("global", s.gc)}${chip("local", s.lc)}<span>${escapeHtml(s.o)}</span></div>
         <div class="sp-line sp-links">${links(s)}<button type="button" class="link-button" data-show="${s.id}">Show in table</button></div>
-      </li>`;
+      </div></li>`;
     }
     if (!list.length) html = `<li>No species of the selected category occur in this cell. Choose another category or perspective above the map.</li>`;
     $("#cell-species").innerHTML = html;
@@ -316,17 +327,20 @@
       data: species,
       index: "id",
       layout: "fitDataStretch",
+      rowHeight: 58,
+      columnDefaults: { vertAlign: "middle" },
       height: "620px",
       placeholder: "No species match these filters.",
       initialSort: [{ column: "bg", dir: "desc" }, { column: "gc", dir: "asc" }],
       columnHeaderVertAlign: "bottom",
       columns: [
         {
-          title: "Species", field: "b", frozen: true, minWidth: 210, headerFilter: "input",
+          title: "Species", field: "b", frozen: true, minWidth: 270, headerFilter: "input",
           headerFilterPlaceholder: "Filter",
           formatter: (cell) => {
             const s = cell.getRow().getData();
-            return `<span class="sp">${escapeHtml(s.b)}</span><span class="sp-links">${links(s)}</span>`;
+            return `<div class="sp-cell">${thumb(s)}<div class="sp-text"><span class="sp">${escapeHtml(s.b)}</span>` +
+              `<span class="sp-links">${links(s)}</span></div></div>`;
           }
         },
         { title: "Common name", field: "c", minWidth: 150, headerFilter: "input", headerFilterPlaceholder: "Filter" },

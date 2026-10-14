@@ -40,7 +40,7 @@ Data retrieved from online services (IUCN Red List, GBIF, NCBI GenBank, PhyloPic
 
 1. Clone or download this repository and open `Pipeline.Rproj`.
 2. Restore the package library: `renv::restore()`.
-3. To skip the slow and online steps, use the Zenodo archive instead of the GitHub repository: it contains the same code together with the fitted models, cached online data, intermediate objects and all outputs.
+3. To skip the slow and online steps, use the Zenodo archive instead of the GitHub repository: it contains the same code together with the fitted models, cached online data, intermediate objects and all outputs. The archive is split into several zip files (code, data and website; outputs; fitted models; cache and intermediate objects); unzip all of them into the same folder to restore the complete project. `MANIFEST.csv` lists which zip file contains each file.
 4. Run `source("run_all.R")`. Missing input data are downloaded on the first run.
 
 Each step can also be rendered on its own once the previous steps have run, or run chunk by chunk in RStudio. To run part of the pipeline with `run_all.R`, set `steps_to_run` (e.g. `steps_to_run <- 3:4`). Rendered reports are written to `output/reports/`, and the R session information of each step to `output/session_info/`.
@@ -78,7 +78,7 @@ output/
 run_all.R               Runs steps 1-4
 5_Website.Rmd           Optional: data for the interactive website
 docs/                   Interactive website (GitHub Pages); docs/data/ is written by 5_Website.Rmd
-make_archive.R          Builds the Zenodo archive (project plus large outputs)
+make_archive.R          Builds the Zenodo archive (project plus large outputs, split into zip files)
 ```
 
 ## Outputs
@@ -165,6 +165,7 @@ These tables are not part of the Supplementary Information, but give the exact v
 The priority lists, the priority maps and the reference sequences of Brazilian mammals can be explored at https://thomasluypaert.github.io/brazil-mammal-edna-priorities/. The site is a static page in `docs/`, served with GitHub Pages:
 
 - `docs/index.html`, `docs/assets/`: page, styles, script, and the libraries (Leaflet, Tabulator) and fonts (Spectral, IBM Plex Sans Condensed; SIL Open Font Licence), all stored locally.
+- `docs/img/species/`: one thumbnail photo per species where an openly licensed photo exists (iNaturalist, Wikimedia Commons), used under its author's licence and credited on the site. Photos can be corrected in `photo_overrides` in `5_Website.Rmd`.
 - `docs/data/`: species table, priority species per grid cell, all species per grid cell (as bit sets, for the location filter of the sequence downloads), map outlines, rivers and cities, and reference sequences, written by `5_Website.Rmd` after Part 4.
 
 To update the site, render `5_Website.Rmd` and push the changes in `docs/data/`. To publish it, go to the repository's Settings > Pages and deploy from the `main` branch, folder `/docs`. To view it locally, run `servr::httd("docs")`.
