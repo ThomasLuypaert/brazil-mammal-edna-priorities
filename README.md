@@ -164,9 +164,11 @@ These tables are not part of the Supplementary Information, but give the exact v
 
 The priority lists, the priority maps and the reference sequences of Brazilian mammals can be explored at https://thomasluypaert.github.io/brazil-mammal-edna-priorities/. The site is a static page in `docs/`, served with GitHub Pages:
 
-- `docs/index.html`, `docs/assets/`: page, styles, script, and the libraries (Leaflet, Tabulator) and fonts (Spectral, IBM Plex Sans Condensed; SIL Open Font Licence), all stored locally.
-- `docs/img/species/`: one thumbnail photo per species where an openly licensed photo exists (iNaturalist, Wikimedia Commons), used under its author's licence and credited on the site. Photos can be corrected in `photo_overrides` in `5_Website.Rmd`.
+- `docs/index.html`, `docs/assets/`: page, styles, script, interface text in English and Portuguese (`docs/assets/js/i18n.js`), and the libraries (Leaflet, Tabulator) and fonts (Spectral, IBM Plex Sans Condensed; SIL Open Font Licence), all stored locally.
+- `docs/img/species/`: one thumbnail photo per species where an openly licensed photo exists (iNaturalist, Wikimedia Commons), used under its author's licence and credited on the site. Photos can be corrected in `photo_overrides` in `5_Website.Rmd`. Short species descriptions (the opening sentences of each species' English Wikipedia article, CC BY-SA 4.0) are in `docs/data/summaries.json` and can be corrected in `summary_overrides`.
 - `docs/data/`: species table, priority species per grid cell, all species per grid cell (as bit sets, for the location filter of the sequence downloads), map outlines, rivers and cities, and reference sequences, written by `5_Website.Rmd` after Part 4.
+
+Settings at the top of `5_Website.Rmd` set the Zenodo DOI, the repository, the article DOI (once published) and optional visitor counting with GoatCounter (no cookies, no personal data). Views can be shared as links, e.g. `…/#lang=pt&cat=research&sp=Cyclopes_rufus`.
 
 To update the site, render `5_Website.Rmd` and push the changes in `docs/data/`. To publish it, go to the repository's Settings > Pages and deploy from the `main` branch, folder `/docs`. To view it locally, run `servr::httd("docs")`.
 

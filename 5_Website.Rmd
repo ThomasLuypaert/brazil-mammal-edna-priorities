@@ -72,6 +72,14 @@ load_step("4_Barcoding_priorities", c(
 site_version <- "1.0.0"
 zenodo_doi   <- "10.5281/zenodo.23365811"
 repository   <- "https://github.com/ThomasLuypaert/brazil-mammal-edna-priorities"
+article_doi  <- ""                    # the article's DOI, once published (shown in the citation)
+
+# Visitor and download counts with GoatCounter (https://www.goatcounter.com; no cookies,
+# no personal data). Leave empty to switch counting off. show_counter shows the totals
+# in the website's footer (also enable "Allow adding visitor counts on your website"
+# in the GoatCounter settings).
+goatcounter_code <- "brazil-mammal-edna"                # e.g. "brazil-mammal-edna"
+show_counter     <- TRUE
 
 data_dir <- here("docs", "data")
 dir.create(file.path(data_dir, "sequences"), recursive = TRUE, showWarnings = FALSE)
@@ -312,6 +320,103 @@ rm(photo_overrides, open_licences_inat)
 
 ```
 
+**Species summaries (English and Portuguese):**
+
+A short description of each species with a Wikipedia page: the first sentences of the article's summary (Wikipedia page summary API), at most about 280 characters, shown in the website's species card with a link to the article. English summaries come from the English Wikipedia pages found above; Portuguese summaries from the Portuguese Wikipedia pages, found through Wikidata in the same way. The Portuguese version of the website falls back to the English summary where there is no Portuguese one. Wikipedia text is licensed CC BY-SA 4.0 and attributed on the website. The results are cached.
+
+Summaries can be replaced or removed by hand in `summary_overrides` (`lang` is `"en"` or `"pt"`); set `text` to `NA` to remove one.
+
+```{r}
+
+summary_overrides <- tibble::tribble(
+  ~binomial, ~lang, ~text
+  # "Genus species", "en", "Replacement text.",
+)
+
+# Summary of one Wikipedia article (url: the article's address)
+wiki_summary <- function(name, url) {
+  Sys.sleep(0.2)
+  domain <- sub("^(https?://[^/]+)/.*$", "\\1", url)
+  title  <- sub(".*/wiki/", "", url)
+  js <- get_json(paste0(domain, "/api/rest_v1/page/summary/", title))
+  if (is.null(js) || !identical(js$type, "standard") || is.null(js$extract)) return(NULL)
+  data.frame(binomial = name,
+             extract  = js$extract,
+             page     = js$content_urls$desktop$page %||% url)
+}
+
+# 1. English
+
+if (needs_build("website_summaries.rds")) {
+  with_page <- links %>% filter(!is.na(wikipedia))
+  summaries_en <- bind_rows(Map(wiki_summary, with_page$binomial, with_page$wikipedia))
+  saveRDS(summaries_en, cache_file("website_summaries.rds"))
+  rm(with_page, summaries_en)
+}
+
+# 2. Portuguese: find the Portuguese Wikipedia pages through Wikidata (taxon name, P225)
+
+if (needs_build("website_summaries_pt.rds")) {
+
+  query_ptwiki <- function(names) {
+    values <- paste0('"', names, '"', collapse = " ")
+    query <- paste0(
+      'SELECT ?name ?article WHERE { VALUES ?name { ', values, ' } ',
+      '?item wdt:P225 ?name . ',
+      '?article schema:about ?item ; schema:isPartOf <https://pt.wikipedia.org/> . }'
+    )
+    rows <- get_json("https://query.wikidata.org/sparql", list(query = query, format = "json"))$results$bindings
+    if (length(rows) == 0) return(data.frame(binomial = character(), wikipedia_pt = character()))
+    data.frame(binomial     = vapply(rows, function(r) r$name$value, ""),
+               wikipedia_pt = vapply(rows, function(r) r$article$value, ""))
+  }
+
+  batches  <- split(brz_mam_taxonomy$binomial, ceiling(seq_along(brz_mam_taxonomy$binomial) / 100))
+  links_pt <- bind_rows(lapply(batches, function(b) { Sys.sleep(1); query_ptwiki(b) })) %>%
+    distinct(binomial, .keep_all = TRUE)
+  summaries_pt <- bind_rows(Map(wiki_summary, links_pt$binomial, links_pt$wikipedia_pt))
+
+  saveRDS(list(links = links_pt, summaries = summaries_pt), cache_file("website_summaries_pt.rds"))
+  rm(query_ptwiki, batches, links_pt, summaries_pt)
+}
+
+# Keep whole sentences up to about 280 characters (at least the first sentence,
+# shortened at a word boundary if it is very long)
+shorten <- function(x, max_chars = 280) {
+  x <- trimws(gsub("\\s+", " ", x))
+  sentences <- regmatches(x, gregexpr(".+?(?:[.!?]+(?=\\s+[\\p{Lu}(])|$)", x, perl = TRUE))[[1]]
+  sentences <- trimws(sentences)
+  out <- sentences[1]
+  for (s in sentences[-1]) {
+    if (nchar(out) + 1 + nchar(s) > max_chars) break
+    out <- paste(out, s)
+  }
+  if (nchar(out) > max_chars + 60) out <- paste0(sub("\\s+\\S*$", "", substr(out, 1, max_chars)), "…")
+  out
+}
+
+pt_cache  <- readRDS(cache_file("website_summaries_pt.rds"))
+links_pt  <- pt_cache$links
+
+summaries <- bind_rows(
+  readRDS(cache_file("website_summaries.rds")) %>% mutate(lang = "en"),
+  pt_cache$summaries %>% mutate(lang = "pt")
+) %>%
+  mutate(text = vapply(extract, shorten, "")) %>%
+  select(binomial, lang, text, page) %>%
+  anti_join(summary_overrides, by = c("binomial", "lang")) %>%
+  bind_rows(summary_overrides %>% filter(!is.na(text)) %>%
+              left_join(bind_rows(links %>% transmute(binomial, lang = "en", page = wikipedia),
+                                  links_pt %>% transmute(binomial, lang = "pt", page = wikipedia_pt)),
+                        by = c("binomial", "lang")))
+
+message(sum(summaries$lang == "en"), " species with an English and ",
+        sum(summaries$lang == "pt"), " with a Portuguese Wikipedia summary")
+
+rm(summary_overrides, shorten, wiki_summary, pt_cache)
+
+```
+
 **Build the species table:**
 
 Species are numbered in alphabetical order; the numbers link the species table to the grid cells and the sequences.
@@ -334,6 +439,7 @@ site_species <- brz_mam_taxonomy %>%
                                      median_exclusion_prob_global), by = "binomial") %>%
   left_join(primers_with_sequence, by = "binomial") %>%
   left_join(links, by = "binomial") %>%
+  left_join(links_pt, by = "binomial") %>%
   mutate(across(c(global_category, local_category), ~ replace_na(.x, "None")),
          n_primers = replace_na(n_primers, 0L),
          common_name = unname(common_names[binomial]),
@@ -391,6 +497,7 @@ species_json <- lapply(seq_len(nrow(site_species)), function(i) {
     po = unbox(round(s$median_exclusion_prob_global, 3)),
     np = unbox(s$n_primers),
     w = unbox(if (is.na(s$wikipedia)) NA else s$wikipedia),
+    wp = unbox(if (is.na(s$wikipedia_pt)) NA else s$wikipedia_pt),
     gb = unbox(if (is.na(s$gbif_key)) NA else as.integer(s$gbif_key)),
     rm = unbox(s$has_range_map),
     im = unbox(if (is.na(s$image)) NA else s$image),
@@ -401,7 +508,23 @@ species_json <- lapply(seq_len(nrow(site_species)), function(i) {
 
 write_json_compact(list(species = species_json), file.path(data_dir, "species.json"))
 
-rm(primers_with_sequence, species_json, common_names, links, photos, img_dir, download_photo, stale, get_json, ua)
+# Wikipedia summaries, in a separate file that the website loads only when needed:
+# {"<species number>": [English text, English page, Portuguese text, Portuguese page]}
+summary_ids <- unique(summaries$binomial)
+pick <- function(name, l, field) {
+  x <- summaries[[field]][summaries$binomial == name & summaries$lang == l]
+  if (length(x)) x[1] else NA
+}
+summaries_json <- setNames(
+  lapply(summary_ids, function(b) c(pick(b, "en", "text"), pick(b, "en", "page"),
+                                    pick(b, "pt", "text"), pick(b, "pt", "page"))),
+  unname(species_id[summary_ids])
+)
+summaries_json <- summaries_json[!is.na(names(summaries_json))]
+write_json_compact(summaries_json, file.path(data_dir, "summaries.json"))
+
+rm(primers_with_sequence, species_json, common_names, links, photos, img_dir, download_photo, stale, get_json, ua,
+   summaries, summaries_json, summary_ids, pick, links_pt)
 
 ```
 
@@ -614,6 +737,9 @@ write_json_compact(
   list(version    = unbox(site_version),
        generated  = unbox(format(Sys.Date())),
        doi        = unbox(zenodo_doi),
+       article_doi = unbox(article_doi),
+       goatcounter = unbox(goatcounter_code),
+       show_counter = unbox(show_counter),
        repository = unbox(repository),
        n_species  = unbox(nrow(site_species)),
        primers    = primer_info),
