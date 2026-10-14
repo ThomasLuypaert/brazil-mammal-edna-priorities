@@ -96,10 +96,17 @@
   });
 
   function fillMeta() {
-    const zen = meta.doi && meta.doi.startsWith("10.") ? `https://doi.org/${meta.doi}` : "#";
-    ["#zenodo-link", "#zenodo-link-2"].forEach((s) => { $(s).href = zen; });
-    ["#repo-link", "#repo-link-2"].forEach((s) => { $(s).href = /^https?:/.test(meta.repository || "") ? meta.repository : "#"; });
-    $("#version-note").textContent = `Data version ${meta.version}, generated ${meta.generated}.`;
+    // Values may be plain strings or one-element lists (if meta.json was edited by hand)
+    const val = (x) => String((Array.isArray(x) ? x[0] : x) ?? "").trim();
+    try {
+      const doi = val(meta.doi), repo = val(meta.repository);
+      const zen = doi.startsWith("10.") ? `https://doi.org/${doi}` : "#";
+      ["#zenodo-link", "#zenodo-link-2"].forEach((s) => { $(s).href = zen; });
+      ["#repo-link", "#repo-link-2"].forEach((s) => { $(s).href = /^https?:/.test(repo) ? repo : "#"; });
+      $("#version-note").textContent = `Data version ${val(meta.version)}, generated ${val(meta.generated)}.`;
+    } catch (err) {
+      console.error(err);   // the links are not essential; never block the page
+    }
   }
 
   function buildSummary() {
