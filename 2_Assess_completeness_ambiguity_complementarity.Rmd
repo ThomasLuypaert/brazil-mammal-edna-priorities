@@ -55,13 +55,7 @@ load_step("1_Prepare_data", c(
 
 **Plotting helper:**
 
-Since gghalves is no longer maintained, we manually create half-violins with standard ggplot2 layers.
-
 ```{r}
-
-# Polygons for half-violins: for each level of the factor `x`, a kernel
-# density of `y` drawn to the right of the level's position, scaled to a
-# common maximum width.
 
 half_violin_polygons <- function(data, x, y, width = 0.45) {
   groups <- split(as.data.frame(data), data[[x]], drop = TRUE)
@@ -99,17 +93,7 @@ In the code, the unambiguous sets are labelled `unique`.
 **For each species and its synonyms, check the presence and number of unique sequences in the eDNA dataframe for each region/primer combination:**
 
 ```{r}
-# 2. Analyzing database completeness
-
-# Assess presence of Brazilian mammal species in the reference eDNA database.
-# We check for both:
-
-#   1) All detected sequences per species (including sequences shared across species)
-
-#   2) Unique sequences per species (sequences not shared with other species)
-
-# 2.1. Prepare list to store detected sequences for all species, for each region/primer
-
+#
 brz_mam_sequences_all <- vector("list", length(brz_mam_eDNA))
 names(brz_mam_sequences_all) <- names(brz_mam_eDNA)
 
@@ -156,7 +140,7 @@ for (i in seq_along(brz_mam_sequences_all)) {
   brz_mam_sequences_all[[i]] <- data.table::rbindlist(brz_mam_sequences_all[[i]])
 }
 
-# 2.2. Detect sequences that are unique to each species
+# Detect sequences that are unique to each species
 
 # For sequences shared across multiple species, set to NA
 
@@ -169,7 +153,7 @@ for (i in seq_along(brz_mam_sequences_all)) {
     ungroup()
 }
 
-# 2.3. Summarize completeness and sequence depth for all detected sequences
+# Summarize completeness and sequence depth for all detected sequences
 
 # For each species, calculate:
 
@@ -197,7 +181,8 @@ for (i in seq_along(brz_mam_sequences_all)) {
     relocate(binomial, nseq, presence)
 }
 
-# 2.4. Summarize completeness for uniquely detected sequences
+# Summarize completeness for uniquely detected sequences
+
 brz_mam_completeness_unique <- vector("list", length(brz_mam_sequences_unique))
 names(brz_mam_completeness_unique) <- names(brz_mam_sequences_unique)
 
@@ -218,14 +203,16 @@ for (i in seq_along(brz_mam_sequences_unique)) {
     relocate(binomial, nseq, presence)
 }
 
-# 2.5. Combine list elements into single data.frames for downstream analysis
+# Combine list elements into single data.frames for downstream analysis
+
 brz_mam_sequences_all <- data.table::rbindlist(brz_mam_sequences_all)
 brz_mam_sequences_unique <- data.table::rbindlist(brz_mam_sequences_unique)
 
 brz_mam_completeness_all <- data.table::rbindlist(brz_mam_completeness_all)
 brz_mam_completeness_unique <- data.table::rbindlist(brz_mam_completeness_unique)
 
-# 2.6. Remove temporary objects
+# Remove temporary objects
+
 rm(subset, i, j)
 
 ```
@@ -576,9 +563,7 @@ brz_mam_clade_primer_completeness_unique <-
   ungroup()
 
 
-# 4. Final fine-tuning: factor levels and combined identifiers
-
-# Order nseqs for plotting, and create region_nseqs combining region and nseqs.
+# 4. Final fine-tuning
 
 factor_levels <- c(">10", "6-10", "2-5", "1")
 
@@ -1499,8 +1484,7 @@ brz_mam_sequences_clean <- na.omit(brz_mam_sequences_all)
 
 # One representative sequence per species and primer: the medoid, i.e. the
 # sequence with the smallest summed distance to all other sequences of the
-# same species. This uses all sequences of a species without random sampling.
-# Ties are resolved alphabetically, the result does not depend on the input order.
+# same species.Ties are resolved alphabetically, the result does not depend on the # input order.
 
 medoid_sequence <- function(seqs) {
   seqs <- sort(unique(seqs))
@@ -1875,7 +1859,9 @@ ambig_seq_per_primer_clade
 
 ***Sources of sequence ambiguity:***
 
-Ambiguity can only be detected when both species that share a sequence have been sequenced. Differences in ambiguity between orders can therefore reflect real differences in how genetically similar species are, or differences in how well close relatives have been sequenced. We look at this in three ways, using all sequences of each species and the phylogenies from Part 1:
+Ambiguity can only be detected when both species that share a sequence have been sequenced. Differences in ambiguity between orders can therefore reflect real differences in how genetically similar or different species are, or variation in how well close relatives have been sequenced.
+
+[We look at this in three ways, using all sequences of each species and the phylogenies from Part 1]{.underline}:
 
 1.  **Under-detection:** we randomly remove sequenced species, keeping 20% to 100% of them (100 times each), and recount the proportion of the remaining species affected by ambiguity. If ambiguity is under-detected when fewer species are sequenced, this proportion drops as fewer species are kept.
 2.  **Sequencing of the closest relative:** for each sequenced species, we check whether its sister species (its closest relative among the Brazilian mammals, based on the phylogenies averaged over the 100 trees) is also sequenced.
@@ -2165,14 +2151,6 @@ rm(tree_species, phylo_dist, grafted_species, sister_table, seq_table, seq_looku
 ```
 
 The table `ambiguity_sources_by_order` summarises the three analyses per order. Points in panels b and c show individual primers and sister pairs, respectively.
-
-> **Interpretation**: When we keep fewer of the sequenced species, the proportion affected by ambiguity drops in every order (panel A). In primates, it falls from `r val("Primates", "percent_ambiguous")`% with all sequenced species to `r val("Primates", "percent_ambiguous_at_20")`% with 20% of them, and in rodents from `r val("Rodentia", "percent_ambiguous")`% to `r val("Rodentia", "percent_ambiguous_at_20")`%. Ambiguity is therefore under-detected when fewer species are sequenced, and the current values reported in the main text are likely underestimates.
->
-> Sister species are sequenced less often in rodents, bats and didelphid marsupials (`r val_range(c("Rodentia", "Chiroptera", "Didelphimorphia"), "percent_sister_sequenced")`% of sequenced species have a sequenced sister species) than in carnivores, artiodactylans, sloths and anteaters, and armadillos (`r val_range(c("Carnivora", "Artiodactyla", "Pilosa", "Cingulata"), "percent_sister_sequenced")`%; panel B). Primates are in between (`r val("Primates", "percent_sister_sequenced")`%), yet have by far the most ambiguity, so missing relatives do not explain the differences between orders on their own.
->
-> When both sister species are sequenced, their sequences differ much less in primates and artiodactylans (median `r val("Primates", "median_sister_distance")`% and `r val("Artiodactyla", "median_sister_distance")`%) than in rodents, bats, carnivores and didelphid marsupials (`r val_range(c("Rodentia", "Chiroptera", "Carnivora", "Didelphimorphia"), "median_sister_distance")`%; panel C). This also holds for sister species that split at similar times (panel D). High ambiguity in primates and artiodactylans therefore reflects closely related species with very similar mitochondrial sequences, while lower ambiguity in rodents, bats and didelphid marsupials reflects both greater differences between species and incomplete sequencing of close relatives.
->
-> `r n_excluded` of 731 species were left out of panels B–D because they or their sister species were grafted onto the phylogenies. Grafted species are often recently described or split, which are the species most likely to share sequences, so panels B–D may underestimate ambiguity. Artiodactyla, Pilosa and Cingulata have few sister pairs, so their values in panels C and D are indicative only.
 
 ```{r}
 

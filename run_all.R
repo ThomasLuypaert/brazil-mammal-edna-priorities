@@ -28,6 +28,7 @@ dir.create(report_dir, recursive = TRUE, showWarnings = FALSE)
 dir.create(session_dir, recursive = TRUE, showWarnings = FALSE)
 
 # Runtimes of earlier runs, so that a partial run does not overwrite them
+
 runtimes <- if (file.exists(runtime_file)) {
   utils::read.csv(runtime_file, stringsAsFactors = FALSE)
 } else {

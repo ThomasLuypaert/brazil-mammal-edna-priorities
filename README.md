@@ -4,64 +4,61 @@ Code and data for:
 
 > Luypaert T., Farias I.P., Hrbek T., Peres C.A. & Haugaasen T. (2026). Knowledge gaps and sequencing priorities for mammalian eDNA metabarcoding in the world's largest tropical forest country. *Nature Communications* [in review].
 
-Archived version (Zenodo): [10.5281/zenodo.23365811](https://doi.org/10.5281/zenodo.23365811)  
-Interactive website: https://thomasluypaert.github.io/brazil-mammal-edna-priorities/
+Archived version (Zenodo): [10.5281/zenodo.23365811](https://doi.org/10.5281/zenodo.23365811)\
+Interactive website: <https://thomasluypaert.github.io/brazil-mammal-edna-priorities/>
 
 ## Overview
 
 The pipeline quantifies reference database completeness for 731 Brazilian mammal species across 10 eDNA metabarcoding primers targeting four mitochondrial loci (12S, 16S, COI, CytB), models the drivers of omission from reference databases, and derives a Barcoding Priority Score (BPS) to identify sequencing priorities from a global and a local (Brazilian) perspective.
 
 | Step | File | Description | Main outputs |
-|---|---|---|---|
+|------------------|------------------|------------------|------------------|
 | 0 | `0_Get_reference_data/` | Download MIDORI2 sequences and build primer-specific reference databases with CRABS | `data/CRABS/` |
-| 1 | `1_Prepare_data.Rmd` | Read the reference databases and trace the source of their sequences; harmonise the species list, synonyms, phylogenies, IUCN status, traits and range-based covariates | `output/intermediate/1_Prepare_data.rds`, Fig. S1 |
-| 2 | `2_Assess_completeness_ambiguity_complementarity.Rmd` | Database completeness, sequence ambiguity and its sources, haplotypic depth, and primer complementarity | Figs 1-2, Figs S2-S25, Table S1 |
-| 3 | `3_Drivers_of_database_omission.Rmd` | Bayesian models of database inclusion, diagnostics and marginal effects | Fig. 3, Figs S26-S50, Tables S2-S3, fitted models in `output/models/` |
-| 4 | `4_Barcoding_priorities.Rmd` | Barcoding Priority Score, priority lists and spatial prioritisation | Figs 4-5, Figs S51-S53, Tables S4-S5 |
+| 1 | `1_Prepare_data.Rmd` | Read the reference databases and trace the source of their sequences. Harmonise the species list, synonyms, phylogenies, IUCN status, traits and range-based covariates | `output/intermediate/1_Prepare_data.rds`, Fig. S1 |
+| 2 | `2_Assess_completeness_ambiguity_complementarity.Rmd` | Quantify database completeness, sequence ambiguity and its sources, haplotypic depth, and primer complementarity | Figs 1-2, Figs S2-S25, Table S1 |
+| 3 | `3_Drivers_of_database_omission.Rmd` | Fit bayesian models of database inclusion, diagnostics and marginal effects | Fig. 3, Figs S26-S50, Tables S2-S3, fitted models in `output/models/` |
+| 4 | `4_Barcoding_priorities.Rmd` | Derive a Barcoding Priority Score, priority lists and spatial prioritisation maps | Figs 4-5, Figs S51-S53, Tables S4-S5 |
 
-An optional fifth document, `5_Website.Rmd`, writes the data for the interactive website in `docs/` (see [Interactive website](#interactive-website)). It does not change any result in the paper.
+An fifth document, `5_Website.Rmd`, prepares the data for the [website](#interactive-website) that can be used to engage interactively with the priority lists and download reference datasets.
 
-Each step saves the objects needed by later steps to `output/intermediate/`, and each later step loads only the objects it uses, listed at the top of the document. The statistics reported in the main text are calculated in dedicated chunks ("Statistics reported in the main text") and appear in the rendered reports in `output/reports/`.
+Each step saves the objects needed by later steps to `output/intermediate/`, and each later step loads only the objects it uses, listed at the top of the document. The statistics reported in the main text are calculated in specific chunks ("Statistics reported in the main text") and appear in the rendered reports in `output/reports/`.
 
 ## Data
 
-All public input datasets are downloaded automatically, from pinned versions, when they are missing. Sources, versions and file names are listed in `data/README.md`. The only input that must be generated separately is the set of reference databases in `data/CRABS/` (step 0), which are included in this repository.
+All public input datasets are downloaded automatically from pinned versions when they are missing. Sources, versions and file names are listed in `data/README.md`. The only input that must be generated separately is the set of reference databases in `data/CRABS/` (step 0), which are included in this repository.
 
-Data retrieved from online services (IUCN Red List, GBIF, NCBI GenBank, PhyloPic) change over time. They are retrieved once and cached in `output/cache/`. To recompute them, set `rebuild_cache <- TRUE` at the top of the relevant document, or delete individual files in `output/cache/`. Slow steps (grafting species onto the phylogenies, extracting population density within range maps, calculating evolutionary distinctiveness) are cached in the same way. The cached files and fitted models used for the paper are included in the archived version on Zenodo.
+Data retrieved from online services (IUCN Red List, GBIF, NCBI GenBank, PhyloPic) change over time. They are retrieved once and cached in `output/cache/`. To recompute them, set `rebuild_cache <- TRUE` at the top of the relevant document, or delete the files in `output/cache/`. Slow steps (grafting species onto the phylogenies, extracting population density within range maps, calculating evolutionary distinctiveness) are cached in the same way. The cached files and fitted models used for the paper are included in the archived version on Zenodo.
 
 ## Requirements
 
 - R 4.6.1. Package versions are recorded in `renv.lock`.
 - CRABS v1.0.7 (step 0 only), with bash on Linux. The databases in the paper were built on a SLURM cluster with a Singularity container of CRABS.
-- An internet connection only when input files are missing or cached data are rebuilt.
-- An IUCN Red List API token, set as the environment variable `IUCN_REDLIST_KEY` (e.g. in `~/.Renviron`), only needed if the IUCN data are retrieved again.
+- An internet connection (when input files are missing or cached data are rebuilt).
+- An IUCN Red List API token, set as the environment variable `IUCN_REDLIST_KEY` (e.g. in `~/.Renviron`). This is only needed if the IUCN data are retrieved again.
 
 ## How to run
 
-1. Clone or download this repository and open `Pipeline.Rproj`.
-2. Restore the package library: `renv::restore()`.
-3. To skip the slow and online steps, use the Zenodo archive instead of the GitHub repository: it contains the same code together with the fitted models, cached online data, intermediate objects and all outputs. The archive is split into several zip files (code, data and website; outputs; fitted models; cache and intermediate objects); unzip all of them into the same folder to restore the complete project. `MANIFEST.csv` lists which zip file contains each file.
-4. Run `source("run_all.R")`. Missing input data are downloaded on the first run.
+1.  Clone or download this repository and open `Pipeline.Rproj`.
+2.  Restore the package library: `renv::restore()`.
+3.  To skip the slow and online steps, use the Zenodo archive instead of the GitHub repository. It contains the same code together with the fitted models, cached online data, intermediate objects and all outputs. The archive is split into several zip files (code, data and website; outputs; fitted models; cache and intermediate objects). Unzip all of them into the same folder to restore the complete project. `MANIFEST.csv` lists which zip file contains each file.
+4.  Run `source("run_all.R")`. Missing input data are downloaded on the first run.
 
-Each step can also be rendered on its own once the previous steps have run, or run chunk by chunk in RStudio. To run part of the pipeline with `run_all.R`, set `steps_to_run` (e.g. `steps_to_run <- 3:4`). Rendered reports are written to `output/reports/`, and the R session information of each step to `output/session_info/`.
+Each step can also be executed on its own once the previous steps have run, or run chunk by chunk in RStudio. To run part of the pipeline with `run_all.R`, set `steps_to_run` (e.g. `steps_to_run <- 3:4`). The rendered reports are written to `output/reports/`, and the R session information of each step to `output/session_info/`.
 
 ## Runtime and hardware
 
 | Step | Approximate runtime |
-|---|---|
-| 0 | [ ] |
-| 1 | 1 min with cached data ([ ] on the first run, which queries IUCN, GBIF and NCBI and grafts the phylogenies) |
+|------------------------------------|------------------------------------|
+| 1 | 1 min with cached data (longer on the first run, which queries IUCN, GBIF and NCBI and grafts the phylogenies) |
 | 2 | 35 min |
-| 3 | 53 min with cached models (fitting the models takes [ ] hours) |
-| 4 | 31 min with cached evolutionary distinctiveness ([ ] hours on the first run) |
-
-Timings were recorded on [machine, CPU, cores, RAM]. Runtimes from the most recent run are written to `output/runtimes.csv`.
+| 3 | 53 min with cached models (longer if fitting the models from scratch) |
+| 4 | 31 min with cached evolutionary distinctiveness (longer if calculating from scratch) |
 
 Fitted brms models are cached in `output/models/` and reused unless the data or model specification change. Delete these files to force a refit (several hours). The fits used in the paper are included in the Zenodo archive.
 
 ## Repository structure
 
-```
+```         
 0_Get_reference_data/   CRABS scripts to build the reference databases
 R/                      Shared functions (reading/writing intermediate objects, saving figures and tables)
 data/                   Input data (see data/README.md)
@@ -88,7 +85,7 @@ File names are given without extension. Supplementary figure and table files sta
 **Main figures** (`output/figures/main/`)
 
 | Figure | Files | Step |
-|---|---|---|
+|------------------------|------------------------|------------------------|
 | Fig. 1a | `Fig1a_completeness_by_primer` | 2 |
 | Fig. 1b | `Fig1b_completeness_by_order_all`, `Fig1b_completeness_by_order_unambiguous` | 2 |
 | Fig. 1c | `Fig1c_completeness_by_depth_all`, `Fig1c_completeness_by_depth_unambiguous` | 2 |
@@ -112,7 +109,7 @@ File names are given without extension. Supplementary figure and table files sta
 **Supplementary figures** (`output/figures/supplementary/`)
 
 | Figure | Files | Step |
-|---|---|---|
+|------------------------|------------------------|------------------------|
 | Fig. S1 | `FigS1_sequence_source_classification` | 1 |
 | Figs S2-S12 | `FigS<n>_completeness_by_primer_<Order>` (orders in alphabetical order) | 2 |
 | Fig. S13 | `FigS13_ambiguity_and_divergence_by_primer` | 2 |
@@ -134,7 +131,7 @@ File names are given without extension. Supplementary figure and table files sta
 **Supplementary tables** (`output/tables/supplementary/`)
 
 | Table | File | Step |
-|---|---|---|
+|------------------------|------------------------|------------------------|
 | Table S1 | `TableS1_cross_vs_within_locus_pairs` | 2 |
 | Table S2 | `TableS2_model1_parameters` | 3 |
 | Table S3 | `TableS3_model2_parameters` | 3 |
@@ -148,7 +145,7 @@ Table 1 (primers) is compiled from the literature and is not produced by the pip
 These tables are not part of the Supplementary Information, but give the exact values behind the figures and the statistics reported in the text.
 
 | File | Content | Step |
-|---|---|---|
+|------------------------|------------------------|------------------------|
 | `completeness_by_primer_and_order` | Database completeness per primer and order, for all and unambiguous sequences | 2 |
 | `ambiguity_by_primer_and_order` | Species affected by sequence ambiguity per primer and order | 2 |
 | `ambiguity_sources_by_order` | Sources of sequence ambiguity per order (Fig. S14) | 2 |
@@ -160,17 +157,15 @@ These tables are not part of the Supplementary Information, but give the exact v
 | `priorities_by_region` | Mean priority richness per grid cell, per biome | 4 |
 | `threatened_species_by_region` | Traits and scores of globally threatened species per biome | 4 |
 
-## Interactive website
+## Interactive website {#interactive-website}
 
-The priority lists, the priority maps and the reference sequences of Brazilian mammals can be explored at https://thomasluypaert.github.io/brazil-mammal-edna-priorities/. The site is a static page in `docs/`, served with GitHub Pages:
+The results can be explored at <https://thomasluypaert.github.io/brazil-mammal-edna-priorities/> (in English and Portuguese):
 
-- `docs/index.html`, `docs/assets/`: page, styles, script, interface text in English and Portuguese (`docs/assets/js/i18n.js`), and the libraries (Leaflet, Tabulator) and fonts (Spectral, IBM Plex Sans Condensed; SIL Open Font Licence), all stored locally.
-- `docs/img/species/`: one thumbnail photo per species where an openly licensed photo exists (iNaturalist, Wikimedia Commons), used under its author's licence and credited on the site. Photos can be corrected in `photo_overrides` in `5_Website.Rmd`. Short species descriptions (the opening sentences of each species' English Wikipedia article, CC BY-SA 4.0) are in `docs/data/summaries.json` and can be corrected in `summary_overrides`.
-- `docs/data/`: species table, priority species per grid cell, all species per grid cell (as bit sets, for the location filter of the sequence downloads), map outlines, rivers and cities, and reference sequences, written by `5_Website.Rmd` after Part 4.
+- **Map:** priority species richness per 25 × 25 km grid cell, by priority category and perspective, with the list of priority species in any cell and the range of any species.
+- **Priority list:** all 731 species with their priority categories, Barcoding Priority Score and its components, searchable, filterable and downloadable (CSV).
+- **Reference sequences:** the reference sequences of Brazilian mammals per primer (FASTA or CSV), filtered by order, priority category or location.
 
-Settings at the top of `5_Website.Rmd` set the Zenodo DOI, the repository, the article DOI (once published) and optional visitor counting with GoatCounter (no cookies, no personal data). Views can be shared as links, e.g. `…/#lang=pt&cat=research&sp=Cyclopes_rufus`.
-
-To update the site, render `5_Website.Rmd` and push the changes in `docs/data/`. To publish it, go to the repository's Settings > Pages and deploy from the `main` branch, folder `/docs`. To view it locally, run `servr::httd("docs")`.
+The website is generated from the outputs of Parts 1-4 by `5_Website.Rmd` and served from `docs/`.
 
 ## Licence
 
@@ -178,4 +173,4 @@ Code: MIT (see `LICENSE`). Derived data and outputs: CC BY 4.0. Third-party inpu
 
 ## Contact
 
-Thomas Luypaert ([email])
+Thomas Luypaert (thomas.luypaert\@outlook.com/thomas.luypaert\@nmbu.no)

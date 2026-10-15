@@ -4,16 +4,16 @@ The scripts in this folder build one curated reference database per primer set w
 
 ## Procedure
 
-1. Download the NCBI taxonomy used by CRABS to assign taxonomy to the sequences.
-2. Download the 12S, 16S, COI and CytB sequences from MIDORI2 (Leray et al. 2022; GenBank release 264, 14/12/2024, database type "total", RAW) and import them into CRABS format.
-3. Run in-silico PCR with each primer set (Table 1 in the paper) to extract the amplicons.
-4. Use the extracted amplicons as seeds for pairwise global alignment, to recover amplicons that lack one or both primer-binding regions (sequences up to 10,000 bp; at least 95% identity and 95% coverage).
-5. Dereplicate (keeping unique sequences per species), keep mammals only, and export in SINTAX format.
+1.  Download the NCBI taxonomy used by CRABS to assign taxonomy to the sequences.
+2.  Download the 12S, 16S, COI and CytB sequences from MIDORI2 (Leray et al. 2022; GenBank release 264, 14/12/2024, database type "total", RAW) and import them into CRABS format.
+3.  Run in-silico PCR with each primer set (Table 1 in the paper) to extract the amplicons.
+4.  Use the extracted amplicons as seeds for pairwise global alignment, to recover amplicons that lack one or both primer-binding regions (sequences up to 10,000 bp; at least 95% identity and 95% coverage).
+5.  Dereplicate (keeping unique sequences per species), keep mammals only, and export in SINTAX format.
 
 ## Scripts
 
 | Script | Step | Output (in `work/`, unless stated) |
-|---|---|---|
+|------------------------|------------------------|------------------------|
 | `config.sh` | Settings shared by all scripts: paths, CRABS container, MIDORI2 release, primer sequences | – |
 | `1_download_taxonomy.sh` | 1 | `taxonomy/names.dmp`, `nodes.dmp`, `nucl_gb.accession2taxid` |
 | `2_download_MIDORI.sh` | 2 | `<locus>/1_midori_<locus>_download_final.fasta` |
@@ -28,7 +28,7 @@ To run, first check the settings in `config.sh`:
 
 Then run the scripts in order from this folder, either with `bash` or, on a SLURM cluster, with `sbatch`:
 
-```bash
+``` bash
 cd 0_Get_reference_data
 sbatch 1_download_taxonomy.sh          # or: bash 1_download_taxonomy.sh
 sbatch 2_download_MIDORI.sh
@@ -37,7 +37,7 @@ sbatch 4_pairwise_global_alignment.sh
 sbatch 5_dereplicate_subset_export.sh
 ```
 
-Each script needs the output of the previous one, so start a script only when the previous one has finished (or chain them with `sbatch --dependency=afterok:<job id>`). The `#SBATCH` resource settings are those used for the paper; steps 4 and 5 can each take a few days.
+Each script needs the output of the previous one, so start a script only when the previous one has finished. The `#SBATCH` resource settings are those used for the paper, but can be personalized for your system.
 
 The NCBI taxonomy is not versioned: `1_download_taxonomy.sh` downloads the current files, so rebuilding the databases later may give slightly different taxonomic assignments.
 
@@ -46,7 +46,7 @@ The NCBI taxonomy is not versioned: `1_download_taxonomy.sh` downloads the curre
 `data/CRABS/` contains one FASTA file per primer set, named `7_midori_<locus>_export_<primer>.fasta`. `1_Prepare_data.Rmd` reads these files and names them by the primer identifiers used in the paper (Table 1):
 
 | File | Primer (paper) | Original name |
-|---|---|---|
+|------------------------|------------------------|------------------------|
 | `7_midori_12S_export_mimammal.fasta` | Ushio | MiMammal-U |
 | `7_midori_12S_export_riaz_degen.fasta` | Riaz | 12S-V5 (with the degenerate reverse primer of Kocher et al.) |
 | `7_midori_12S_export_taberlet.fasta` | Taberlet | Mamm01 |

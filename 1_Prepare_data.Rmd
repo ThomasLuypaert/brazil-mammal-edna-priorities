@@ -18,7 +18,7 @@ This is Part 1 of the analysis for the paper *"Knowledge Gaps and Sequencing Pri
 
 In this document, we prepare the reference sequences and the associated species metadata (taxonomy, synonyms, phylogenies, conservation status, traits and range-based covariates) for all downstream analyses.
 
-**Inputs:** `data/CRABS/` (step 0). All other input data (species lists, phylogenies, traits, range maps and the population density raster) are downloaded from pinned versions on first run (see `data/README.md`). IUCN Red List data are retrieved through the IUCN API, which requires a token stored in the environment variable `IUCN_REDLIST_KEY`; the cached result in `output/cache/` is used on later runs.
+**Inputs:** `data/CRABS/` (step 0). All other input data (species lists, phylogenies, traits, range maps and the population density raster) are downloaded from pinned versions on first run (see `data/README.md`). IUCN Red List data are retrieved through the IUCN API, which requires a token stored in the environment variable `IUCN_REDLIST_KEY` - the cached result in `output/cache/` is used on later runs.
 
 **Output:** `output/intermediate/1_Prepare_data.rds`, used by Parts 2-4.
 
@@ -43,9 +43,6 @@ library(progress)
 library(sf)
 library(terra)
 library(exactextractr)
-
-# Loaded last so that dplyr functions are not masked by functions with the
-# same name in other packages (e.g. seqinr::count)
 library(tidyverse)
 
 ```
@@ -186,9 +183,9 @@ rm(crabs_files, database_dirs, is_valid_fasta, i)
 
 **Trace the source of sequences:**
 
-To assess the source of the MIDORI2 sequences, we randomly sampled 10% of the unique GenBank accession numbers in our curated mammal reference database and retrieved the corresponding full GenBank records via the NCBI Entrez API. Each record was checked for evidence of environmental origin (the "/environmental_sample" qualifier, or an "environmental sample" or "uncultured" organism designation), which GenBank uses to indicate sequences generated without a reliably identified source organism. Records lacking these direct indicators were then checked for evidence that they instead originated from an identified individual organism: either an explicit specimen voucher, or other indications of individual-level sampling such as an isolate identifier, tissue type, or a free-text mention of tissue or blood in the isolation source.
+To assess the source of the MIDORI2 sequences, we randomly sampled 10% of the unique GenBank accession numbers in our curated mammal reference database and retrieved the corresponding full GenBank records via the NCBI Entrez API. Each record was checked for evidence of environmental origin (the "/environmental_sample" qualifier, or an "environmental sample" or "uncultured" organism designation), which GenBank uses to indicate sequences generated without a reliably identified source organism. Records lacking these direct indicators were then checked for evidence that they instead originated from an identified individual organism being either an explicit specimen voucher, or other indications of individual-level sampling such as an isolate identifier, tissue type, or a free-text mention of tissue or blood in the isolation source.
 
-We used this to classify each record into one of four categories: vouchered specimen, where the sequence could be linked to a formally preserved specimen; voucherless specimen, where the record indicated organism-derived material without a retrievable voucher; environmental, where the record carried evidence of environmental origin; or no source reported, where none of the relevant fields were populated.
+We used this to classify each record into one of four categories: vouchered specimen (where the sequence could be linked to a formally preserved specimen), voucherless specimen (where the record indicated organism-derived material without a retrievable voucher), environmental (where the record carried evidence of environmental origin), and no source reported (where none of the relevant fields were populated).
 
 The GenBank records are retrieved once and cached, as the records themselves can be updated over time.
 
@@ -201,8 +198,8 @@ if (needs_build("genbank_records.rds")) {
     batch_size    <- 200
     sample_prop   <- 0.10
     max_retries   <- 5
-    request_pause <- 0.34   # seconds between requests, to respect the NCBI rate limit
-    backoff_base  <- 2      # seconds; doubles with each retry
+    request_pause <- 0.34   # respect the NCBI rate limit
+    backoff_base  <- 2      # respect the NCBI rate limit
 
     # 1. Get unique accession numbers from the curated reference database
 
@@ -341,9 +338,9 @@ if (needs_build("genbank_records.rds")) {
 
 **Classify the source of each record:**
 
-Records are assigned to four categories, checked in this order:
+Records are assigned to four categories, checked in the following order:
 
-1.  *Environmental*: flagged by the /environmental_sample qualifier, an "environmental sample" or "uncultured" organism designation, or a free-text isolation source mentioning water, soil, sediment, etc.
+1.  *Environmental*: flagged by the /environmental_sample qualifier, an "environmental sample" or "uncultured" organism designation, or a free-text source mentioning water, soil, sediment, etc.
 2.  *Vouchered specimen*: cites a specimen voucher.
 3.  *Voucherless specimen*: organism-derived (an isolate identifier, a tissue type, or a free-text mention of tissue, blood, muscle, etc.) but without a formal voucher.
 4.  *No source reported*: none of the above fields are populated.
@@ -708,9 +705,12 @@ if (build_synonyms) {
 
 **Load the synonyms list:**
 
-Several rules are enforced on the loaded list: each species includes its own accepted name, and no accepted name of a species in the checklist is listed as a synonym of another species (this applies duplicated-synonym rule 1 above to all accepted names, including those that appear in only one other species' list).
+[Several rules are enforced on the loaded list]{.underline}:
 
-Synonym lists compiled from taxonomic databases can also contain names that are currently accepted for a *different* species outside Brazil, for example historical names or homonyms. Such names are listed for review below. Synonyms confirmed as errors are removed through `excluded_synonyms`; the remaining cases are species that the Brazilian checklist treats as synonyms of a Brazilian species (lumps).
+1.  Each species includes its own accepted name
+2.  No accepted name of a species in the checklist is listed as a synonym of another species (this applies duplicated-synonym rule 1 above to all accepted names, including those that appear in only one other species' list).
+
+Synonym lists compiled from taxonomic databases can also contain names that are currently accepted for a *different* species outside Brazil, for example historical names or homonyms. Such names are listed for manual review below. Synonyms confirmed as errors are removed through `excluded_synonyms`. The remaining cases are species that the Brazilian checklist treats as synonyms of a Brazilian species (lumps).
 
 ```{r}
 

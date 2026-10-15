@@ -54,9 +54,6 @@ library(ggrepel)
 library(ggtext)
 library(patchwork)
 library(rmdd)
-
-# Loaded last so that these functions are not masked by functions with the
-# same name in other packages
 library(magrittr)
 library(purrr)
 library(tidyr)
@@ -1237,7 +1234,9 @@ rm(plot_tree, graft_status, EDGE2_species_tree, orders_nodes, phylopics,
 
 **What drives the priority species: score components per category and order (Figs S51 and S52):**
 
-To show why species end up on the priority lists, we decompose the score of each priority species into its three components. Because the score is a product (BPS = ED₂ × extinction probability × PO), its logarithm is the sum of the logarithms of the components. For each priority species, we express each component relative to its median across all species (log₁₀), so that the three contributions add up to how far the species' score lies above that of a typical species. For each group, the bars show the mean value of each component across its priority species, relative to a typical species. Only priority species are included (per perspective), so the plots show what drives the species on the lists, not the average species of a group. The three components are shown side by side: first for each priority class (conservation, research, watch) as an overview, then for taxonomic groups and biomes, in one panel per priority class and perspective, so that groups can be compared within the same class.
+To show why species end up on the priority lists, we decompose the score of each priority species into its three components. Because the score is a product (BPS = ED2 × extinction probability × PO), its logarithm is the sum of the logarithms of the components. For each priority species, we express each component relative to its median across all species (log₁₀), so that the three contributions add up to how far the species' score lies above that of a typical species.
+
+For each group, the bars show the mean value of each component across its priority species, relative to a typical species. Only priority species are included (per perspective), so the plots show what drives the species on the lists, not the average species of a group. The three components are shown side by side: first for each priority class (conservation, research, watch) as an overview, then for taxonomic groups and biomes, in one panel per priority class and perspective, so that groups can be compared within the same class.
 
 ```{r, fig.width=12, fig.height=8}
 

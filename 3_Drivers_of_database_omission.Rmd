@@ -101,7 +101,7 @@ Recently described species are expected to be missing from reference databases, 
 ```{r, fig.width=12, fig.height=10}
 
 # 1. Species described per decade, and their inclusion in the reference
-#    databases (percentage of species-primer combinations with a sequence)
+#    databases
 
 description_by_decade <- brz_mam_completeness_traits_all %>%
   filter(!is.na(year_described)) %>%
@@ -186,11 +186,6 @@ save_figure(description_plot, "FigS26_species_described_by_decade",
 rm(p_described, p_included, p_included_locus, description_plot, locus_colours)
 
 ```
-
-> **Interpretation**: `r round(percent_last_20, 1)`% of Brazilian mammal species were described in the last 20 years, and `r round(percent_last_10, 1)`% in the last 10 years (`r round(percent_since_2010, 1)`% since 2010), so recent descriptions are not rare. Their inclusion in the reference databases is very low: `r round(description_by_decade$percent_included[description_by_decade$decade == 2010], 1)`% and `r round(description_by_decade$percent_included[description_by_decade$decade == 2020], 1)`% of species-primer combinations have a sequence for species described in the 2010s and 2020s (panel b).
->
-> The gap depends strongly on the locus (panel c). For species described since 2010, cytochrome b remains the best represented (`r round(inclusion_recent_by_locus[["2010"]][inclusion_recent_by_locus$region == "Cytb"], 1)`% for the 2010s), while 12S and 16S, targeted by most eDNA primers, are almost absent (`r round(inclusion_recent_by_locus[["2010"]][inclusion_recent_by_locus$region == "12S"], 1)`% and `r round(inclusion_recent_by_locus[["2010"]][inclusion_recent_by_locus$region == "16S"], 1)`%). New species are typically described using cytochrome b (and COI for bats), so their sequences are often not available for the loci used in eDNA metabarcoding.
-
 
 ```{r}
 
@@ -481,7 +476,6 @@ fit_2 <- brm(
 
 ```{r, fig.width = 21, fig.height=21}
 
-
 font_add_google("Roboto Condensed", "roboto_condensed")
 showtext_auto()
 showtext_opts(dpi = 400)
@@ -617,8 +611,6 @@ save_figure(composite_ppc_model2, "FigS39_ppc_model2", width = 13, height = 13, 
 
 ```{r, fig.width= 21, fig.height=7}
 
-
-
 # Null model 
 
 p_bars_0 <- pp_check(fit_0, type = "bars", ndraws = 1000) +
@@ -715,7 +707,6 @@ save_figure(plot_2_rangesize, "FigS42_ppc_model2_range_size", width = 15, height
 Next, we will assess the trace plots for the three models, which should look like hairy caterpillars, indicating the chains are mixed well.
 
 ```{r}
-
 
 # Extract presence-submodel parameters only (fixed + random effects).
 # brms names mi()-wrapped predictor coefficients with a "bsp_" prefix
@@ -922,8 +913,6 @@ summary(fit_2)$random$binomial[, 5:7]
 [Parameter tables (Tables S2 and S3)]{.underline}:
 
 ```{r}
-
-
 
 models <- list(Model_1 = fit_1, Model_2 = fit_2)
 
